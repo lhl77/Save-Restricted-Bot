@@ -80,31 +80,6 @@ python -u main.py
 7. **进度与清理**：下载/上传显示大小、百分比与速度；完成后立即删除本地临时文件。
 8. **异常**：`FloodWait` 提示等待；`Peer id invalid` 自动放宽 ID 范围 + 刷新会话缓存后重试。
 
-## 项目结构
-
-```
-.
-├── main.py               # 机器人主程序（登录、转发、下载上传、命令）
-├── link_parser.py        # 链接解析（纯标准库，可单独测试）
-├── app.py                # 可选的 Flask 健康页（云平台存活检查用）
-├── config.json           # 配置模板（填好密钥后请勿提交）
-├── requirements.txt
-├── Dockerfile
-├── Procfile
-├── tests/
-│   └── test_link_parser.py
-├── img/                  # README / 健康页用的图片
-├── INSTALL.md            # 安装、配置、部署、排错
-└── README.md
-```
-
-## 本地测试
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-链接解析逻辑全部在 `link_parser.py`（不依赖 pyrogram），可以脱离 Telegram 直接验证。
 
 ## 注意事项
 
