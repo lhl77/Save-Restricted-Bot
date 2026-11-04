@@ -1,14 +1,16 @@
-![Save Restricted Bot](img/2.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lhl77/Save-Restricted-Bot/refs/heads/main/img/2.png" width="40%">
+</p>
 
 # Save Restricted Bot（中文增强版 by LHL）
 
 把设置了「禁止保存内容」的 Telegram 频道 / 群组 / 论坛话题里的消息转发给你：
-公开内容由机器人直接转发或复制，**不需要登录**；受限内容则通过你自己的账号会话下载后上传。
+公开内容由机器人直接转发或复制，**可选登录**；受限内容则通过你自己的账号会话下载后上传。
 
 - 本项目（中文增强版 by LHL）：<https://github.com/lhl77/Save-Restricted-Bot>
 - 原版（bipinkrish）：<https://github.com/bipinkrish/Save-Restricted-Bot>
 
-> 安装、配置、部署与排错请见 [INSTALL.md](INSTALL.md)。
+> 安装、配置、部署与排错请见 [文档](https://blog.lhl.one/artical/1365.html)。
 
 ## 快速开始
 
@@ -109,10 +111,6 @@ python -m unittest discover -s tests -v
 - `sessions.json` 存的是**完整账号凭证**，等同于手机登录态，切勿提交或分享；
 - 机器人只服务 `OWNER_ID` 本人，请勿关闭该限制后再公开部署；
 - 仅供个人备份自己有权限访问的内容，请遵守 Telegram 服务条款与当地法律。
-
-## 文档
-
-<https://blog.lhl.one/artical/1365.html>
 
 ## 致谢
 
