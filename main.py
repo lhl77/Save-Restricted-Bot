@@ -186,12 +186,17 @@ def _load_config():
 
 CONFIG = _load_config()
 
+# config.json 的键名大小写不敏感，Allow_Public / allow_public / ALLOW_PUBLIC 都能认
+_CONFIG_CI = {str(k).upper(): v for k, v in CONFIG.items()}
+
 
 def getenv(name, default=None):
     value = os.environ.get(name)
     if value is not None and str(value).strip() != "":
         return value
     value = CONFIG.get(name)
+    if value is None:
+        value = _CONFIG_CI.get(str(name).upper())
     if value is not None and str(value).strip() != "":
         return value
     return default
@@ -246,10 +251,11 @@ API_HASH = getenv("HASH")
 API_ID_RAW = getenv("ID")
 
 # ---- 用户权限 ----
-# 机器人只服务 OWNER_ID 这一个用户，其他人一律拒绝（没有白名单机制）。
-# OWNER_ID 就是你自己：启动后给机器人发 /id 即可看到，或找 @userinfobot 查。
+# 默认只服务 OWNER_ID 一个人；
+# ALLOW_PUBLIC=true 时对所有人开放（任何人发消息都能用）。
 _owner_ids = parse_id_set(getenv("OWNER_ID"))
 OWNER_ID = min(_owner_ids) if _owner_ids else None
+ALLOW_PUBLIC = _as_bool(getenv("ALLOW_PUBLIC", False), False)
 
 MAX_RANGE = _as_int(getenv("MAX_RANGE", 100), 100)   # 0 表示不限制
 DELAY = _as_float(getenv("DELAY", 3), 3.0)           # 每条之间的间隔秒数
@@ -1071,7 +1077,9 @@ def _keyboard():
 # --------------------------------------------------------------------------- #
 
 def is_allowed(user_id):
-    """权限判断：只有 OWNER_ID 本人可以使用。"""
+    """权限判断：ALLOW_PUBLIC 时对所有人开放，否则只允许 OWNER_ID 本人。"""
+    if ALLOW_PUBLIC:
+        return True
     if OWNER_ID is None or user_id is None:
         return False
     try:
@@ -2148,7 +2156,9 @@ def cmd_id(client, message):
             lines.append("用户名：@%s" % user.username)
     lines.append("当前会话 ID：`%s`" % message.chat.id)
     lines.append("")
-    if OWNER_ID is None:
+    if ALLOW_PUBLIC:
+        lines.append("当前为**公开模式**（`ALLOW_PUBLIC=true`），所有人都可以使用。")
+    elif OWNER_ID is None:
         lines.append("未配置 `OWNER_ID`，机器人目前拒绝所有人使用。")
     elif user is not None and is_allowed(user.id):
         lines.append("你就是管理员（`OWNER_ID`），可以正常使用。")
@@ -2850,11 +2860,13 @@ def main():
     log("本仓库：%s" % FORK_REPO)
     log("原版仓库：  %s" % ORIGIN_REPO)
 
-    if OWNER_ID is None:
+    if ALLOW_PUBLIC:
+        log("[警告] ALLOW_PUBLIC=true：机器人对所有人公开可用！")
+    elif OWNER_ID is None:
         log("[警告] 未配置 OWNER_ID，机器人将拒绝所有人使用！"
-            "请填好 config.json 的 OWNER_ID 后重启")
+            "请填好 config.json 的 OWNER_ID 后重启，或把 ALLOW_PUBLIC 设为 true")
     else:
-        log("仅允许管理员使用：%s" % OWNER_ID)
+        log("仅允许管理员使用：%s（想公开则把 ALLOW_PUBLIC 设为 true）" % OWNER_ID)
 
     log("已保存的用户会话：%d 个" % len(SESSIONS))
     log("单次最多处理消息数：%s，消息间隔：%s 秒"

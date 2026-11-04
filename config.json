@@ -3,6 +3,7 @@
   "ID": "",
   "HASH": "",
   "OWNER_ID": "",
+  "ALLOW_PUBLIC": false,
   "MAX_RANGE": 100,
   "DELAY": 3
 }
