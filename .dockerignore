@@ -1,0 +1,29 @@
+# 构建镜像时不要把这些打包进去
+.git
+.gitignore
+.dockerignore
+
+# 本地虚拟环境
+.venv/
+.venv*/
+venv/
+
+# 会话凭证 / 本地配置（运行时用 -v 挂载）
+*.session
+*.session-journal
+sessions.json
+sessions.json.tmp
+config.local.json
+
+# 运行时产物
+downloads/
+unknown_errors.txt
+*.log
+__pycache__/
+*.py[cod]
+tests/
+
+# 系统文件
+.DS_Store
+.idea/
+.vscode/

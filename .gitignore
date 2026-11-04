@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv*/
+venv/
+
+# Pyrogram 会话文件（含登录凭证，切勿提交！）
+*.session
+*.session-journal
+mybot.session
+myacc.session
+
+# 临时下载目录
+downloads/
+*.log
+
+# Pyrogram 运行时产生的未知错误日志
+unknown_errors.txt
+
+# 本地私密配置：真实密钥请放这些文件里，不要写进 config.json
+config.local.json
+
+# 系统 / 编辑器文件
+.DS_Store
+.idea/
+.vscode/
+
+# 用户会话凭证（含完整账号权限，切勿提交！）
+sessions.json
+sessions.json.tmp
+

@@ -1,6 +1,8 @@
 {
-    "TOKEN": "",
-    "ID": "",
-    "HASH": "",
-    "STRING": null
+  "TOKEN": "",
+  "ID": "",
+  "HASH": "",
+  "OWNER_ID": "",
+  "MAX_RANGE": 100,
+  "DELAY": 3
 }
