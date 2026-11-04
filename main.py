@@ -260,6 +260,11 @@ ALLOW_PUBLIC = _as_bool(getenv("ALLOW_PUBLIC", False), False)
 MAX_RANGE = _as_int(getenv("MAX_RANGE", 100), 100)   # 0 表示不限制
 DELAY = _as_float(getenv("DELAY", 3), 3.0)           # 每条之间的间隔秒数
 
+# 除 OWNER_ID 以外的人，单个文件允许的最大体积（单位 MB）；0 = 不限制。
+# 用于公开模式下防止陌生人拿你的服务器/账号下载超大文件。
+PUBLIC_MAX_FILE_SIZE = max(0, _as_int(getenv("PUBLIC_MAX_FILE_SIZE", 0), 0))
+MAX_PUBLIC_FILE_BYTES = PUBLIC_MAX_FILE_SIZE * 1024 * 1024
+
 # 相册并发下载数（1 = 串行；越大越快，但更吃带宽与 CPU）
 ALBUM_WORKERS = max(1, _as_int(getenv("ALBUM_WORKERS", 3), 3))
 # 临时文件最长保留秒数 / 定时清理间隔秒数
@@ -1182,6 +1187,50 @@ def format_size(num):
     return "%.2f TB" % value
 
 
+def is_owner(user_id):
+    """是否为 OWNER_ID 本人（与 ALLOW_PUBLIC 无关）。"""
+    if OWNER_ID is None or user_id is None:
+        return False
+    try:
+        return int(user_id) == int(OWNER_ID)
+    except (TypeError, ValueError):
+        return False
+
+
+def message_file_size(msg):
+    """取消息里媒体文件的字节数；纯文本等返回 0。"""
+    for attr in ("document", "video", "audio", "animation", "voice",
+                 "video_note", "sticker"):
+        obj = getattr(msg, attr, None)
+        size = getattr(obj, "file_size", None) if obj is not None else None
+        if size:
+            return int(size)
+    photo = getattr(msg, "photo", None)
+    if photo is not None:
+        return int(getattr(photo, "file_size", 0) or 0)
+    return 0
+
+
+def exceeds_public_limit(user_id, msg):
+    """
+    非 OWNER_ID 且单文件超过 PUBLIC_MAX_FILE_SIZE 时，返回该文件大小（字节）；
+    否则返回 0。PUBLIC_MAX_FILE_SIZE = 0 表示不限制。
+    """
+    if MAX_PUBLIC_FILE_BYTES <= 0 or is_owner(user_id):
+        return 0
+    size = message_file_size(msg)
+    if size > MAX_PUBLIC_FILE_BYTES:
+        return size
+    return 0
+
+
+def public_limit_text():
+    """把公开用户单文件上限格式化成可读文本。"""
+    if MAX_PUBLIC_FILE_BYTES <= 0:
+        return "不限制"
+    return format_size(MAX_PUBLIC_FILE_BYTES)
+
+
 class SpeedMeter:
     """简单的速度采样器（带平滑）。"""
 
@@ -1595,6 +1644,19 @@ def send_one(message, msg, client, prefix=""):
     """下载并发送单条消息。返回 True 表示成功。"""
     msg_type = get_message_type(msg)
 
+    # 公开模式下的单文件大小限制（OWNER_ID 本人不受限）
+    requester = message.from_user.id if message.from_user else None
+    over = exceeds_public_limit(requester, msg)
+    if over:
+        log("用户 %s 的请求超出单文件上限：%s > %s"
+            % (requester, format_size(over), public_limit_text()))
+        reply(message,
+              "❌ **文件超出公开用户的大小限制**\n\n"
+              "这个文件 **%s**，超过了单文件上限 **%s**。\n"
+              "如需下载更大的文件，请联系管理员。"
+              % (format_size(over), public_limit_text()))
+        return False
+
     # 纯文本消息：直接带实体转发
     if msg_type == "Text":
         try:
@@ -1715,6 +1777,21 @@ def send_album(message, items, client, prefix=""):
         return False
     if not {get_message_type(item) for item in items} <= ALBUM_TYPES:
         return False  # 含不支持的类型，交给调用方逐条发送
+
+    # 公开模式下的单文件大小限制（OWNER_ID 本人不受限）
+    requester = message.from_user.id if message.from_user else None
+    too_big = [(item, exceeds_public_limit(requester, item)) for item in items]
+    too_big = [(item, size) for item, size in too_big if size]
+    if too_big:
+        log("用户 %s 的相册中有 %d 个文件超出单文件上限"
+            % (requester, len(too_big)))
+        reply(message,
+              "❌ **相册中有文件超出大小限制**\n\n"
+              "最大一个 **%s**，超过了单文件上限 **%s**。\n"
+              "已跳过这组相册，可先联系管理员。"
+              % (format_size(max(size for _, size in too_big)),
+                 public_limit_text()))
+        return True
 
     status, task_token, cancel_event = create_cancel_task(
         message, "__正在下载相册__（点下方按钮可取消）")
@@ -2873,6 +2950,8 @@ def main():
         % (MAX_RANGE or "不限制", DELAY))
     log("相册并发下载数：%d，临时文件最长保留：%d 秒"
         % (ALBUM_WORKERS, TEMP_MAX_AGE))
+    log("非管理员单文件大小上限：%s（PUBLIC_MAX_FILE_SIZE=%d MB，0 为不限制）"
+        % (public_limit_text(), PUBLIC_MAX_FILE_SIZE))
 
     check_crypto()
     threading.Thread(target=cleanup_loop, daemon=True).start()

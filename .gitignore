@@ -16,6 +16,10 @@ myacc.session
 downloads/
 *.log
 
+# 博客文稿（不属于代码仓库内容）
+BLOG.md
+blog.md
+
 # Pyrogram 运行时产生的未知错误日志
 unknown_errors.txt
 

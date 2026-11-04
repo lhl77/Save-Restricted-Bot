@@ -4,6 +4,7 @@
   "HASH": "",
   "OWNER_ID": "",
   "ALLOW_PUBLIC": false,
+  "PUBLIC_MAX_FILE_SIZE": 0,
   "MAX_RANGE": 100,
   "DELAY": 3
 }

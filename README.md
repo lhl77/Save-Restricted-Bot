@@ -33,6 +33,7 @@ python -u main.py
   "HASH": "my.telegram.org 的 api_hash（32 位十六进制）",
   "OWNER_ID": "你自己的用户 ID，默认只服务这个人",
   "ALLOW_PUBLIC": false,
+  "PUBLIC_MAX_FILE_SIZE": 0,
   "MAX_RANGE": 100,
   "DELAY": 3
 }
@@ -44,6 +45,7 @@ python -u main.py
 | `ID` / `HASH` | my.telegram.org 的 `api_id` / `api_hash` |
 | `OWNER_ID` | 管理员用户 ID，默认只有这个人能用 |
 | `ALLOW_PUBLIC` | **`true` 时对所有人公开可用**；`false`（默认）时只服务 `OWNER_ID` |
+| `PUBLIC_MAX_FILE_SIZE` | **除 `OWNER_ID` 以外的用户，单个文件的大小上限（单位 MB）**；`0`（默认）= 不限制 |
 | `MAX_RANGE` | 批量链接单次最多处理多少条 |
 | `DELAY` | 每条消息之间的间隔秒数 |
 
@@ -54,6 +56,8 @@ python -u main.py
 
 - 默认（`ALLOW_PUBLIC: false`）：只有 `OWNER_ID` 本人能用，其他人一律拒绝；
 - 想给别人用：把 `ALLOW_PUBLIC` 改成 `true`，任何人都能发链接给机器人；
+- 想限制别人的下载量：调小 `PUBLIC_MAX_FILE_SIZE`（例如 `50` = 单个文件不得超过 50 MB），
+  **`OWNER_ID` 本人不受这个限制**；
 - 公开模式下会话仍然是**按用户隔离**的：每个人 `/login` 绑定的是自己的账号，
   只能用它下载自己有权访问的内容；没登录的人只能处理公开内容。
 
@@ -71,7 +75,7 @@ python -u main.py
 - **真实设备指纹**：内置多套真实机型画像，按用户 ID 确定性分配（同一账号永远是同一台设备），并修正 pyrogram 把 `system_lang_code` 写死成 `lang_code` 的指纹缺陷
 - **实时进度**：显示已下载大小、百分比与速度，并带「取消」按钮（点击即中断并删临时文件）
 - **相册并发下载**：`ALBUM_WORKERS` 控制并发数，多文件帖可明显提速
-- 全中文提示、可选公开使用、链接解析带单元测试
+- 全中文提示、可选公开使用（可限制陌生人单文件大小）、链接解析带单元测试
 
 ## 支持的链接格式
 
