@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/lhl77/Save-Restricted-Bot/refs/heads/main/img/2.png" width="40%">
+  <img src="https://raw.githubusercontent.com/lhl77/Save-Restricted-Bot/refs/heads/main/img/2.png" width="20%">
 </p>
 
 # Save Restricted Bot（中文增强版 by LHL）
