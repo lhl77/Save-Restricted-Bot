@@ -16,6 +16,7 @@ Save Restricted Bot —— Telegram 受限内容转发机器人（中文增强�
 
 import asyncio
 import base64
+import collections
 import inspect
 import json
 import os
@@ -25,6 +26,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -72,7 +74,7 @@ FORK_REPO = "https://github.com/lhl77/Save-Restricted-Bot"
 ORIGIN_REPO = "https://github.com/bipinkrish/Save-Restricted-Bot"
 
 # 版本号（日历式：年.月.日，改代码时顺手更新）
-BOT_VERSION = "2026.11.04"
+BOT_VERSION = "2026.11.05"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -265,8 +267,25 @@ DELAY = _as_float(getenv("DELAY", 3), 3.0)           # 每条之间的间隔秒�
 PUBLIC_MAX_FILE_SIZE = max(0, _as_int(getenv("PUBLIC_MAX_FILE_SIZE", 0), 0))
 MAX_PUBLIC_FILE_BYTES = PUBLIC_MAX_FILE_SIZE * 1024 * 1024
 
+# 同时进行的「下载 + 上传」任务数上限（全局，跨用户共享）。
+# 任务就是一条链接；相册内部的并发也会被压到这个数值以内。
+MAX_CONCURRENT = max(1, _as_int(getenv("MAX_CONCURRENT", 3), 3))
+
 # 相册并发下载数（1 = 串行；越大越快，但更吃带宽与 CPU）
-ALBUM_WORKERS = max(1, _as_int(getenv("ALBUM_WORKERS", 3), 3))
+# 不允许超过 MAX_CONCURRENT，否则「同时上传的条数」会突破上限。
+ALBUM_WORKERS = max(1, min(_as_int(getenv("ALBUM_WORKERS", 3), 3), MAX_CONCURRENT))
+
+# 排队提示「已等待 N 秒 / 前面还有 N 个任务」的刷新间隔（秒）
+QUEUE_REFRESH = max(1, _as_int(getenv("QUEUE_REFRESH", 5), 5))
+
+# 账号单文件上传上限（MiB）：这是 Telegram 的账号能力限制，
+# 普通账号 2000 MiB（约 1.95 GB），Premium 账号 4000 MiB（约 3.91 GB）。
+# 一旦超过，上传阶段 pyrogram 会直接抛
+#   ValueError: Can't upload files bigger than 2000 MiB
+# 所以必须在下载之前就拦下来，避免白下载几个 GB。
+UPLOAD_LIMIT_FREE_MIB = 2000
+UPLOAD_LIMIT_PREMIUM_MIB = 4000
+
 # 临时文件最长保留秒数 / 定时清理间隔秒数
 TEMP_MAX_AGE = _as_int(getenv("TEMP_MAX_AGE", 3600), 3600)
 CLEANUP_INTERVAL = _as_int(getenv("CLEANUP_INTERVAL", 1800), 1800)
@@ -1052,10 +1071,23 @@ HELP_TEXT = """**使用说明**
 **3. 相册 / 多文件**
 发相册中任意一条消息的链接，整组一起发送；带 `?single` 只发这一条。
 
+一条消息发多个链接时会依次处理，未开始的会显示「排队中」并实时刷新
+（前方还剩几个任务、已等待多久），点「取消排队」可中止当前任务并跳过剩余链接。
+机器人同时最多处理 3 个任务，管理员（`OWNER_ID`）的任务免排队。
+
 **4. 邀请链接**
 发送 **邀请链接** 可让你的会话加入该群组。
 
-**5. 更多帮助**
+**5. 超大文件（超过 2000 MiB）**
+机器人账号开不了 Telegram 会员，单文件只能传 2000 MiB。
+超过时请 `/login` 绑定一个 **Premium** 账号：机器人会先把文件转发到你的
+**收藏夹**（转发不了就下载后再上传到收藏夹），再从收藏夹转发到本会话。
+
+**6. 任务队列（仅管理员）**
+/quere 查看正在处理 / 排队中的任务，可单独取消或全部取消；
+别名 /queue。
+
+**7. 更多帮助**
 https://blog.lhl.one/artical/1365.html
 """
 
@@ -1068,6 +1100,7 @@ BOT_COMMANDS = [
     BotCommand("logout", "解绑并删除已保存的会话"),
     BotCommand("id", "查看自己的用户 ID"),
     BotCommand("cancel", "取消进行中的登录"),
+    BotCommand("quere", "查看 / 取消任务队列（仅管理员）"),
 ]
 
 
@@ -1197,6 +1230,18 @@ def is_owner(user_id):
         return False
 
 
+def format_duration(seconds):
+    """把秒数格式化成「12 秒 / 3 分 05 秒 / 1 小时 02 分」。"""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return "%d 秒" % seconds
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return "%d 分 %02d 秒" % (minutes, sec)
+    hours, minutes = divmod(minutes, 60)
+    return "%d 小时 %02d 分" % (hours, minutes)
+
+
 def message_file_size(msg):
     """取消息里媒体文件的字节数；纯文本等返回 0。"""
     for attr in ("document", "video", "audio", "animation", "voice",
@@ -1229,6 +1274,86 @@ def public_limit_text():
     if MAX_PUBLIC_FILE_BYTES <= 0:
         return "不限制"
     return format_size(MAX_PUBLIC_FILE_BYTES)
+
+
+# --------------------------------------------------------------------------- #
+# 账号上传上限（Telegram 侧限制：普通 2000 MiB / Premium 4000 MiB）
+# --------------------------------------------------------------------------- #
+
+_UPLOAD_LIMIT_CACHE = {}     # {id(client): 字节数}
+
+
+def _client_me(client):
+    """取客户端自己的账号信息；拿不到返回 None。"""
+    me = getattr(client, "me", None)
+    if me is not None:
+        return me
+    try:
+        return client.get_me()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def upload_limit_bytes(client=None):
+    """
+    返回账号的单文件上传上限（字节）。
+
+    pyrogram 在上传前会做同样的判断：
+        file_size_limit_mib = 4000 if self.me.is_premium else 2000
+    超过就直接抛 ValueError（"Can't upload files bigger than 2000 MiB"），
+    而此时文件已经几百 MB 甚至几个 GB 下载完了，纯属浪费带宽与磁盘。
+    """
+    client = client if client is not None else bot
+    key = id(client)
+    cached = _UPLOAD_LIMIT_CACHE.get(key)
+    if cached:
+        return cached
+
+    me = _client_me(client)
+    premium = bool(getattr(me, "is_premium", False)) if me is not None else False
+    mib = UPLOAD_LIMIT_PREMIUM_MIB if premium else UPLOAD_LIMIT_FREE_MIB
+    limit = mib * 1024 * 1024
+    if me is not None:            # 拿不到账号信息时不缓存，下次再试
+        _UPLOAD_LIMIT_CACHE[key] = limit
+    return limit
+
+
+def upload_limit_text(client=None):
+    """把账号上传上限格式化成可读文本，如「2000 MiB（约 1.95 GB，普通账号）」。"""
+    limit = upload_limit_bytes(client)
+    mib = limit // (1024 * 1024)
+    kind = "Premium 账号" if mib >= UPLOAD_LIMIT_PREMIUM_MIB else "普通账号"
+    return "%d MiB（约 %s，%s）" % (mib, format_size(limit), kind)
+
+
+def exceeds_upload_limit(msg, client=None):
+    """单条消息里的文件超过账号上传上限时返回文件大小（字节），否则返回 0。"""
+    size = message_file_size(msg)
+    if size and size > upload_limit_bytes(client):
+        return size
+    return 0
+
+
+def upload_limit_text_message(size, client=None, reason=None):
+    """
+    超过账号上传上限时的中文提示（在下载之前回复）。
+
+    reason：尝试过「收藏夹中转」但失败的原因，会附在下面。
+    """
+    text = (
+        "❌ **文件超过机器人账号的上传上限**\n\n"
+        "这个文件 **%s**，超过了上限 **%s**。\n\n"
+        "Telegram 普通账号单文件最大 2000 MiB，Premium 账号才是 4000 MiB，"
+        "这是账号能力限制，所以已经在**下载之前**就拦下了，不会白占带宽和硬盘。\n\n"
+        "机器人账号开不了会员也没关系，这类文件可以借**你自己的账号**中转：\n"
+        "1. 用 `/login` 绑定一个开通了 **Telegram Premium** 的账号；\n"
+        "2. 重新发送链接 —— 机器人会先把文件转发到你的**收藏夹**"
+        "（转发不了就下载后再上传到收藏夹），再从收藏夹转发到本会话。"
+        % (format_size(size), upload_limit_text(client))
+    )
+    if reason:
+        text += "\n\n本次没有走通收藏夹中转：%s" % reason
+    return text
 
 
 class SpeedMeter:
@@ -1331,6 +1456,8 @@ def create_cancel_task(message, text):
         ACTIVE_TASKS[token] = {"event": event,
                                "chat_id": status.chat.id,
                                "message_id": status.id}
+    # 让 /quere 的「取消」也能打断这次传输
+    bind_transfer_event(event)
     return status, token, event
 
 
@@ -1362,6 +1489,521 @@ def cb_cancel(client, query):
         bot.edit_message_text(task["chat_id"], task["message_id"], "__取消中…__")
     except Exception:  # noqa: BLE001
         pass
+
+
+# --------------------------------------------------------------------------- #
+# 5.2.1 任务队列：所有「链接任务」统一排队
+#
+#   - 全局最多 MAX_CONCURRENT（默认 3）个任务同时下载/上传；
+#   - OWNER_ID 的任务插到最前面（免排队）；
+#   - 一条消息里发多个链接时，未开始的链接显示「排队中」，
+#     并实时刷新「前方还有几个任务 / 已等待多久」；
+#   - 「取消排队」按钮取消整批，/quere 可以取消任意单个任务。
+# --------------------------------------------------------------------------- #
+
+class QueueJob:
+    """一个任务 = 一条链接。"""
+
+    __slots__ = ("token", "batch", "chat_id", "message", "link", "is_owner",
+                 "state", "created", "started", "abort", "transfer_event",
+                 "notice", "index", "total")
+
+    def __init__(self, message, link, index=1, total=1, batch=None, owner=False):
+        self.token = uuid.uuid4().hex[:10]
+        self.batch = batch
+        self.chat_id = message.chat.id
+        self.message = message
+        self.link = link
+        self.is_owner = bool(owner)
+        self.state = "queued"        # queued / running / done / cancelled
+        self.created = time.time()
+        self.started = None
+        self.abort = threading.Event()      # 任务级取消
+        self.transfer_event = None          # 当前正在跑的传输（用于打断）
+        self.notice = None                  # 「排队中」提示消息
+        self.index = index
+        self.total = total
+
+
+class QueueBatch:
+    """一条消息里的一批链接（用于「取消排队」与收尾汇总）。"""
+
+    __slots__ = ("token", "chat_id", "message", "jobs", "remaining", "skipped")
+
+    def __init__(self, chat_id, message, jobs):
+        self.token = uuid.uuid4().hex[:10]
+        self.chat_id = chat_id
+        self.message = message
+        self.jobs = jobs
+        self.remaining = len(jobs)
+        self.skipped = 0
+
+
+QUEUE_LOCK = threading.Lock()
+QUEUE_COND = threading.Condition(QUEUE_LOCK)
+QUEUE_PENDING = {"owner": collections.deque(), "user": collections.deque()}
+QUEUE_RUNNING = {}         # {job_token: QueueJob}
+QUEUE_BATCHES = {}         # {batch_token: QueueBatch}
+QUEUE_WORKERS_STARTED = False
+CURRENT_JOB = threading.local()
+
+
+def queue_markup(token):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("取消排队", callback_data="qcancel:%s" % token),
+    ]])
+
+
+def job_label(job):
+    """任务里那条链接的展示文本（去掉反引号，过长截断）。"""
+    raw = str(getattr(job.link, "raw", job.link) or "").strip()
+    raw = raw.replace("`", "")
+    if len(raw) > 60:
+        raw = raw[:57] + "…"
+    return raw
+
+
+def current_job():
+    """当前线程正在跑的任务（没有则返回 None）。"""
+    return getattr(CURRENT_JOB, "job", None)
+
+
+def job_aborted():
+    """当前任务是否已经被取消（供长循环提前退出）。"""
+    job = current_job()
+    return job is not None and job.abort.is_set()
+
+
+def bind_transfer_event(event):
+    """把本次传输的取消事件挂到当前任务上，/quere 才能打断它。"""
+    job = current_job()
+    if job is None:
+        return
+    job.transfer_event = event
+    if job.abort.is_set():
+        event.set()
+
+
+def queue_running_count():
+    with QUEUE_LOCK:
+        return len(QUEUE_RUNNING)
+
+
+def queue_ahead(job):
+    """这个排队中的任务前面还有多少个任务（管理员插队时算 0）。"""
+    with QUEUE_LOCK:
+        if job.state != "queued":
+            return 0
+        ahead = 0
+        if not job.is_owner:
+            ahead += len(QUEUE_PENDING["owner"])
+        found = False
+        for item in QUEUE_PENDING["owner" if job.is_owner else "user"]:
+            if item is job:
+                found = True
+                break
+            ahead += 1
+        if not found:
+            # 还没入队（「排队中」提示是入队前发的）：按它在消息里的序号估算
+            ahead += max(0, job.index - 1)
+        return ahead
+
+
+def queue_notice_text(job):
+    """「排队中」提示的文本（会被定时刷新）。"""
+    ahead = queue_ahead(job)
+    waited = format_duration(max(0, time.time() - job.created))
+    bits = ["同时进行 %d/%d" % (queue_running_count(), MAX_CONCURRENT)]
+    bits.append("前方还有 %d 个任务" % ahead if ahead else "下一个就是它")
+    bits.append("已等待 %s" % waited)
+    return "⏳ **排队中**（%d/%d）\n`%s`\n%s" % (
+        job.index, job.total, job_label(job), "｜".join(bits))
+
+
+def queue_item_message(job):
+    """发一条「排队中」提示（带「取消排队」按钮）。"""
+    token = job.batch.token if job.batch is not None else ""
+    try:
+        return bot.send_message(job.chat_id, queue_notice_text(job),
+                                reply_markup=queue_markup(token),
+                                disable_web_page_preview=True)
+    except Exception as exc:  # noqa: BLE001
+        log("发送排队提示失败：%s" % exc)
+        return None
+
+
+def queue_item_started(sent):
+    """轮到这一条了：删掉「排队中」提示，让位给进度条。"""
+    if sent is None:
+        return
+    try:
+        bot.delete_messages(sent.chat.id, [sent.id])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def queue_item_skipped(sent, reason="已取消排队"):
+    if sent is None:
+        return
+    try:
+        bot.edit_message_text(sent.chat.id, sent.id, "🚫 **%s**" % reason)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def flush_batch_pending(batch, reason="已取消排队"):
+    """把这一批里还挂着「排队中」的提示统一改成已取消。"""
+    notices = []
+    with QUEUE_LOCK:
+        for job in batch.jobs:
+            if job.notice is not None:
+                notices.append(job.notice)
+                job.notice = None
+    for sent in notices:
+        queue_item_skipped(sent, reason)
+    return len(notices)
+
+
+def start_queue_refresher(batch):
+    """定时刷新这一批的「排队中」提示（前方任务数 / 已等待时间）。"""
+
+    def loop():
+        while True:
+            time.sleep(QUEUE_REFRESH)
+            with QUEUE_LOCK:
+                if batch.remaining <= 0:
+                    return
+                alive = [(job, job.notice) for job in batch.jobs
+                         if job.notice is not None and job.state == "queued"]
+            for job, notice in alive:
+                try:
+                    bot.edit_message_text(notice.chat.id, notice.id,
+                                          queue_notice_text(job),
+                                          reply_markup=queue_markup(batch.token),
+                                          disable_web_page_preview=True)
+                except Exception:  # noqa: BLE001
+                    continue
+
+    threading.Thread(target=loop, daemon=True, name="queue-refresh").start()
+
+
+def enqueue_job(job):
+    """把任务放进队列；管理员的任务进「插队」那条队。"""
+    with QUEUE_COND:
+        QUEUE_PENDING["owner" if job.is_owner else "user"].append(job)
+        QUEUE_COND.notify()
+    if job.is_owner:
+        log("管理员任务插队：%s" % job_label(job))
+
+
+def find_job(token):
+    with QUEUE_LOCK:
+        job = QUEUE_RUNNING.get(token)
+        if job is not None:
+            return job
+        for queue in QUEUE_PENDING.values():
+            for item in queue:
+                if item.token == token:
+                    return item
+    return None
+
+
+def cancel_job(job, reason="已取消"):
+    """
+    取消单个任务：
+      - 排队中的：直接出队，并把「排队中」提示改成已取消；
+      - 运行中的：置位取消事件，让下载/上传/转码立刻抛出 StopTransmission 或直接中止。
+    """
+    event = None
+    was_queued = False
+    with QUEUE_LOCK:
+        if job.state in ("done", "cancelled"):
+            return False
+        was_queued = job.state == "queued"
+        job.state = "cancelled"
+        job.abort.set()
+        event = job.transfer_event
+        for key in ("owner", "user"):
+            try:
+                QUEUE_PENDING[key].remove(job)
+            except ValueError:
+                pass
+        notice = job.notice
+        job.notice = None
+
+    if event is not None:
+        event.set()
+    queue_item_skipped(notice, reason)
+    log("任务已取消（%s）：%s" % (job.token, job_label(job)))
+    if was_queued:
+        # 还没开始就被取消的任务不会经过 run_job，这里补上收尾统计
+        finish_batch_job(job)
+    return True
+
+
+def cancel_batch(batch, reason="已取消排队"):
+    """取消一整批里所有还没结束的任务。"""
+    with QUEUE_LOCK:
+        jobs = [job for job in batch.jobs if job.state in ("queued", "running")]
+    count = 0
+    for job in jobs:
+        if cancel_job(job, reason):
+            count += 1
+    return count
+
+
+def cancel_all_jobs(reason="已取消"):
+    running, queued = queue_snapshot()
+    count = 0
+    for job in running + queued:
+        if cancel_job(job, reason):
+            count += 1
+    return count
+
+
+def finish_batch_job(job):
+    """一个任务收尾：整批跑完时做汇总（比如被取消了多少条）。"""
+    batch = job.batch
+    if batch is None:
+        return
+    with QUEUE_LOCK:
+        batch.remaining -= 1
+        if job.state == "cancelled":
+            batch.skipped += 1
+        done = batch.remaining <= 0
+        if done:
+            QUEUE_BATCHES.pop(batch.token, None)
+    if not done:
+        return
+
+    flush_batch_pending(batch)
+    if batch.skipped:
+        total = len(batch.jobs)
+        log("队列结束：共 %d 个链接，取消 %d 个" % (total, batch.skipped))
+        reply(batch.message,
+              "🚫 **已取消排队**\n\n共 %d 个链接，其中 %d 个未处理。"
+              % (total, batch.skipped))
+
+
+def run_job(job):
+    """在工作线程里执行一个任务。"""
+    with QUEUE_LOCK:
+        if job.state != "queued":
+            return
+        job.state = "running"
+        job.started = time.time()
+        QUEUE_RUNNING[job.token] = job
+
+    notice = job.notice
+    job.notice = None
+    queue_item_started(notice)
+
+    CURRENT_JOB.job = job
+    try:
+        dispatch(job.message, job.link)
+    except FloodWait as exc:
+        seconds = getattr(exc, "value", 60) or 60
+        reply(job.message, "触发 Telegram 频率限制，请 **%s 秒**后再试。" % seconds)
+    except Exception as exc:  # noqa: BLE001
+        reply(job.message, error_text(exc))
+    finally:
+        CURRENT_JOB.job = None
+        job.transfer_event = None
+        with QUEUE_LOCK:
+            QUEUE_RUNNING.pop(job.token, None)
+            if job.state != "cancelled":
+                job.state = "done"
+        finish_batch_job(job)
+
+
+def _queue_take():
+    """取下一个要跑的任务：管理员队列优先。"""
+    with QUEUE_COND:
+        while True:
+            for key in ("owner", "user"):
+                queue = QUEUE_PENDING[key]
+                while queue:
+                    job = queue.popleft()
+                    if job.state == "queued":
+                        return job
+            QUEUE_COND.wait(1.0)
+
+
+def _queue_worker(index):
+    while True:
+        job = _queue_take()
+        try:
+            run_job(job)
+        except Exception as exc:  # noqa: BLE001
+            log("[错误] 队列线程 %d 异常：%s" % (index, exc))
+            traceback.print_exc()
+
+
+def start_queue_workers():
+    """启动 MAX_CONCURRENT 个队列线程（幂等）。"""
+    global QUEUE_WORKERS_STARTED
+    with QUEUE_LOCK:
+        if QUEUE_WORKERS_STARTED:
+            return
+        QUEUE_WORKERS_STARTED = True
+    for index in range(1, MAX_CONCURRENT + 1):
+        threading.Thread(target=_queue_worker, args=(index,), daemon=True,
+                         name="queue-worker-%d" % index).start()
+    log("任务队列已启动：最多同时处理 %d 个任务，管理员任务免排队" % MAX_CONCURRENT)
+
+
+def queue_snapshot():
+    """(运行中的任务, 排队中的任务)，顺序即执行顺序。"""
+    with QUEUE_LOCK:
+        running = sorted(QUEUE_RUNNING.values(), key=lambda j: j.started or 0)
+        queued = [j for j in QUEUE_PENDING["owner"] if j.state == "queued"]
+        queued += [j for j in QUEUE_PENDING["user"] if j.state == "queued"]
+    return running, queued
+
+
+def queue_admin_markup(jobs):
+    """每个任务一个「取消 N」按钮，外加「全部取消」。"""
+    if not jobs:
+        return None
+    rows, row = [], []
+    for index, job in enumerate(jobs, start=1):
+        row.append(InlineKeyboardButton("取消 %d" % index,
+                                        callback_data="qkill:%s" % job.token))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("全部取消", callback_data="qkillall")])
+    return InlineKeyboardMarkup(rows)
+
+
+def render_queue_view():
+    """/quere 的内容与按钮。"""
+    running, queued = queue_snapshot()
+    jobs = running + queued
+    lines = ["**任务队列**（同时最多 %d 个）" % MAX_CONCURRENT, ""]
+    if not jobs:
+        lines.append("当前没有任务。")
+        return "\n".join(lines), None
+
+    for index, job in enumerate(jobs, start=1):
+        if job.state == "running":
+            spend = format_duration(max(0, time.time() - (job.started or job.created)))
+            mark = "🔄 进行中，已用 %s" % spend
+        else:
+            spend = format_duration(max(0, time.time() - job.created))
+            ahead = queue_ahead(job)
+            mark = "⏳ 排队中，已等 %s｜前方 %d 个" % (spend, ahead)
+        who = "👑 " if job.is_owner else ""
+        lines.append("%d. %s`%s`\n　　%s" % (index, who, job_label(job), mark))
+
+    lines.append("")
+    lines.append("点下面的按钮可取消单个任务，或「全部取消」。")
+    return "\n".join(lines), queue_admin_markup(jobs)
+
+
+def _answer(query, text):
+    try:
+        query.answer(text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def refresh_queue_message(message):
+    """重新渲染 /quere 那条消息（取消之后调用）。"""
+    if message is None:
+        return
+    text, markup = render_queue_view()
+    try:
+        bot.edit_message_text(message.chat.id, message.id, text,
+                              reply_markup=markup)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@bot.on_callback_query(filters.regex(r"^qcancel:"))
+def cb_queue_cancel(client, query):
+    """点击「取消排队」：这一批还没结束的任务全部取消。"""
+    token = (query.data or "").split(":", 1)[-1]
+    with QUEUE_LOCK:
+        batch = QUEUE_BATCHES.get(token)
+    if batch is None:
+        _answer(query, "这一批已经处理完了")
+        return
+
+    count = cancel_batch(batch)
+    _answer(query, "已取消 %d 个任务" % count)
+    log("用户取消了整批任务（%d 个）" % count)
+    try:
+        bot.edit_message_reply_markup(query.message.chat.id, query.message.id,
+                                      reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@bot.on_callback_query(filters.regex(r"^qkill:"))
+def cb_queue_kill(client, query):
+    """「取消 N」：取消单个任务（仅管理员）。"""
+    if not is_owner(getattr(query.from_user, "id", None)):
+        _answer(query, "只有管理员可以取消任务")
+        return
+    token = (query.data or "").split(":", 1)[-1]
+    job = find_job(token)
+    if job is None:
+        _answer(query, "任务已经结束")
+    else:
+        cancel_job(job)
+        _answer(query, "已取消")
+    refresh_queue_message(query.message)
+
+
+@bot.on_callback_query(filters.regex(r"^qkillall$"))
+def cb_queue_killall(client, query):
+    """「全部取消」（仅管理员）。"""
+    if not is_owner(getattr(query.from_user, "id", None)):
+        _answer(query, "只有管理员可以取消任务")
+        return
+    count = cancel_all_jobs()
+    _answer(query, "已取消 %d 个任务" % count if count else "没有可取消的任务")
+    refresh_queue_message(query.message)
+
+
+def run_link_queue(message, links):
+    """
+    一批链接统一进全局队列。
+
+    - 全局最多 MAX_CONCURRENT 个任务同时跑；
+    - OWNER_ID 的任务插到最前面（免排队）；
+    - 数量 > 1 时，所有链接先各回一条「排队中」并实时刷新，
+      轮到它的时候自动删掉提示、换成进度条。
+    """
+    links = [link for link in links if link is not None]
+    total = len(links)
+    if total == 0:
+        return
+
+    user = getattr(message, "from_user", None)
+    owner = is_owner(getattr(user, "id", None))
+    jobs = [QueueJob(message, link, index, total, None, owner)
+            for index, link in enumerate(links, start=1)]
+
+    batch = None
+    if total > 1:
+        batch = QueueBatch(message.chat.id, message, jobs)
+        for job in jobs:
+            job.batch = batch
+        with QUEUE_LOCK:
+            QUEUE_BATCHES[batch.token] = batch
+        # 先把所有「排队中」发出去，再入队：否则第一个任务可能瞬间开始，
+        # 后面的提示就来不及发了。
+        for job in jobs:
+            job.notice = queue_item_message(job)
+        start_queue_refresher(batch)
+
+    for job in jobs:
+        enqueue_job(job)
+    return batch
 
 
 def download_thumb(client, msg):
@@ -1415,19 +2057,108 @@ def _safe_stem(path):
     return stem[:80]
 
 
-def _run_ffmpeg(cmd):
+def pillow_available():
+    """是否装了 Pillow（图片重新编码优先用它，不依赖 ffmpeg）。"""
+    if "pillow" not in _TOOL_CACHE:
+        try:
+            from PIL import Image  # noqa: F401
+            _TOOL_CACHE["pillow"] = True
+        except Exception:  # noqa: BLE001
+            _TOOL_CACHE["pillow"] = False
+    return _TOOL_CACHE["pillow"]
+
+
+def transcode_available(msg_type):
+    """
+    当前环境能不能对这类文件「重新编码」。
+
+    没装 ffmpeg（视频）/ 没装 Pillow 与 ffmpeg（图片）时返回 False，
+    调用方就会跳过改哈希这一步，只做改名 —— 避免卡在转码上。
+    """
+    if msg_type in ("Video", "Animation"):
+        return bool(ffmpeg_bin())
+    if msg_type == "Photo":
+        return pillow_available() or bool(ffmpeg_bin())
+    return False
+
+
+def kill_process(proc):
+    """结束子进程（忽略一切错误）。"""
     try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=TRANSCODE_TIMEOUT)
-    except Exception as exc:  # noqa: BLE001
-        log("ffmpeg 调用失败：%s" % exc)
-        return False
-    if result.returncode != 0:
-        tail = (result.stdout or b"").decode("utf-8", "ignore")[-200:]
-        log("ffmpeg 转码失败：%s" % tail.strip())
-        return False
-    return True
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _run_ffmpeg(cmd, cancel_event=None, on_progress=None, timeout=None):
+    """
+    跑一次 ffmpeg。
+
+    用 Popen + 轮询代替 subprocess.run，好处是：
+      - 点「取消」能立刻杀掉 ffmpeg（以前最长要等 TRANSCODE_TIMEOUT 秒）；
+      - 期间可以定时刷新状态文字，不会看起来像卡死在「正在上传」。
+
+    cancel_event：置位后立刻终止并返回 False。
+    on_progress(elapsed)：每隔几秒回调一次，用于刷新状态文字。
+    """
+    timeout = TRANSCODE_TIMEOUT if timeout is None else timeout
+    started = time.time()
+    last_report = 0.0
+
+    try:
+        errfile = tempfile.TemporaryFile()
+    except Exception:  # noqa: BLE001
+        errfile = None
+
+    try:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=errfile if errfile else subprocess.DEVNULL)
+        except Exception as exc:  # noqa: BLE001
+            log("ffmpeg 启动失败：%s" % exc)
+            return False
+
+        try:
+            while proc.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    log("转码已取消，结束 ffmpeg 进程")
+                    kill_process(proc)
+                    return False
+                elapsed = time.time() - started
+                if elapsed > timeout:
+                    log("转码超过 %d 秒，已放弃" % timeout)
+                    kill_process(proc)
+                    return False
+                if on_progress is not None and time.time() - last_report >= 3.0:
+                    last_report = time.time()
+                    try:
+                        on_progress(elapsed)
+                    except Exception:  # noqa: BLE001
+                        pass
+                time.sleep(0.2)
+        finally:
+            tail = ""
+            if errfile is not None:
+                try:
+                    errfile.seek(0)
+                    tail = errfile.read().decode("utf-8", "ignore")[-200:].strip()
+                except Exception:  # noqa: BLE001
+                    tail = ""
+
+        if proc.returncode != 0:
+            log("ffmpeg 转码失败：%s" % (tail or "（无输出）"))
+            return False
+        return True
+    finally:
+        if errfile is not None:
+            try:
+                errfile.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def ffmpeg_has(encoder):
@@ -1448,7 +2179,7 @@ def ffmpeg_has(encoder):
     return (" %s " % encoder) in _TOOL_CACHE["encoders"]
 
 
-def transcode_video(src, dst):
+def transcode_video(src, dst, cancel_event=None, on_progress=None):
     """
     重新编码视频并清除元数据，确保文件哈希变化。
 
@@ -1479,28 +2210,41 @@ def transcode_video(src, dst):
                        "-c", "copy", dst])
 
     for cmd in candidates:
-        if _run_ffmpeg(cmd) and os.path.exists(dst) and os.path.getsize(dst) > 0:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if _run_ffmpeg(cmd, cancel_event, on_progress) \
+                and os.path.exists(dst) and os.path.getsize(dst) > 0:
             return True
         safe_remove(dst)
     return False
 
 
-def transcode_image_ffmpeg(src, dst):
+def transcode_image_ffmpeg(src, dst, cancel_event=None, on_progress=None):
     ffmpeg = ffmpeg_bin()
     if not ffmpeg:
         return False
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
            "-i", src, "-q:v", "2", dst]
-    return _run_ffmpeg(cmd) and os.path.exists(dst)
+    return _run_ffmpeg(cmd, cancel_event, on_progress) and os.path.exists(dst)
 
 
-def transcode_image(src, dst):
+def transcode_image(src, dst, cancel_event=None, on_progress=None):
     """优先用 Pillow 重存 JPEG（顺带抹掉 EXIF），没有 Pillow 时用 ffmpeg。"""
+    if cancel_event is not None and cancel_event.is_set():
+        return False
+    if not pillow_available():
+        return transcode_image_ffmpeg(src, dst, cancel_event, on_progress)
+
     try:
         from PIL import Image
     except Exception:  # noqa: BLE001
-        return transcode_image_ffmpeg(src, dst)
+        return transcode_image_ffmpeg(src, dst, cancel_event, on_progress)
 
+    if on_progress is not None:
+        try:
+            on_progress(0)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         with Image.open(src) as image:
             if image.mode not in ("RGB", "L"):
@@ -1510,14 +2254,37 @@ def transcode_image(src, dst):
         return os.path.exists(dst)
     except Exception as exc:  # noqa: BLE001
         log("Pillow 重新编码失败（%s），改用 ffmpeg" % exc)
-        return transcode_image_ffmpeg(src, dst)
+        return transcode_image_ffmpeg(src, dst, cancel_event, on_progress)
 
 
-def prepare_upload_file(path, msg_type):
+_NO_ENCODER_WARNED = set()
+
+
+def _warn_no_encoder(msg_type):
+    """没装编码工具时只提示一次，避免每条消息都刷屏。"""
+    key = "video" if msg_type in ("Video", "Animation") else "image"
+    if key in _NO_ENCODER_WARNED:
+        return
+    _NO_ENCODER_WARNED.add(key)
+    if key == "video":
+        log("[提示] 未安装 ffmpeg：视频跳过重新编码，只改名（文件哈希不变）")
+        log("        需要改哈希请安装：apt install -y ffmpeg")
+    else:
+        log("[提示] 未安装 Pillow / ffmpeg：图片跳过重新编码，只改名")
+        log("        需要改哈希请安装：pip install Pillow")
+
+
+def prepare_upload_file(path, msg_type, on_status=None, cancel_event=None):
     """
     上传前处理：
       1. 文件重命名为「原名_年月日-时分秒.扩展名」；
       2. 视频 / 图片会重新编码（清元数据、调参数），彻底改变文件哈希。
+
+    注意：没装 ffmpeg（视频）或 Pillow + ffmpeg（图片）时，直接跳过重新编码，
+    只做改名。以前这种情况会卡在「正在上传」很久且点取消没反应。
+
+    on_status(text)：刷新状态文字（转码可能很久，不能一声不吭）。
+    cancel_event：置位后终止转码。
 
     返回实际上传用的路径（处理失败时退化为仅改名，再失败就返回原路径）。
     """
@@ -1528,8 +2295,13 @@ def prepare_upload_file(path, msg_type):
     stem = _safe_stem(path)
     stamp = time.strftime("%Y%m%d-%H%M%S")
 
+    can_transcode = msg_type in ("Video", "Animation", "Photo")
+    want = bool(TRANSCODE_MODE and can_transcode and transcode_available(msg_type))
+    if TRANSCODE_MODE and can_transcode and not want:
+        _warn_no_encoder(msg_type)
+
     target_ext = ext
-    if TRANSCODE_MODE:
+    if want:
         if msg_type in ("Video", "Animation"):
             target_ext = ".mp4"
         elif msg_type == "Photo":
@@ -1537,15 +2309,28 @@ def prepare_upload_file(path, msg_type):
 
     new_path = os.path.join(DOWNLOAD_DIR, "%s_%s%s" % (stem, stamp, target_ext))
 
-    if TRANSCODE_MODE:
+    if want:
+        if on_status is not None:
+            try:
+                on_status("__正在重新编码__（点下方按钮可取消）")
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _progress(elapsed):
+            if on_status is None:
+                return
+            on_status("__正在重新编码__：已用 %s（点下方按钮可取消）"
+                      % format_duration(elapsed))
+
         ok = False
         if msg_type in ("Video", "Animation"):
-            ok = transcode_video(path, new_path)
+            ok = transcode_video(path, new_path, cancel_event, _progress)
         elif msg_type == "Photo":
-            ok = transcode_image(path, new_path)
+            ok = transcode_image(path, new_path, cancel_event, _progress)
         if ok:
             safe_remove(path)
             return new_path
+        safe_remove(new_path)
 
     # 仅改名（或转码失败时的兜底）
     fallback = os.path.join(DOWNLOAD_DIR, "%s_%s%s" % (stem, stamp, ext))
@@ -1674,6 +2459,23 @@ def send_one(message, msg, client, prefix=""):
         reply(message, "跳过：暂不支持该消息类型（投票 / 位置 / 联系方式 / 服务消息等）。")
         return False
 
+    # 下载之前先确认机器人账号能传得动这么大：
+    # 普通账号 2000 MiB、Premium 4000 MiB，超了 pyrogram 会在上传时直接报
+    # ValueError: Can't upload files bigger than 2000 MiB
+    too_big = exceeds_upload_limit(msg, bot)
+    if too_big:
+        log("文件超过机器人账号上传上限：%s > %s，尝试借用户账号收藏夹中转"
+            % (format_size(too_big), format_size(upload_limit_bytes(bot))))
+        reason = deliver_via_saved(message, [msg], client)
+        if reason is None:
+            return True
+        log("收藏夹中转未成功：%s" % reason)
+        reply(message, upload_limit_text_message(too_big, bot, reason))
+        return False
+
+    if job_aborted():
+        return False
+
     status, task_token, cancel_event = create_cancel_task(
         message, "__正在下载__（点下方按钮可取消）")
     markup = cancel_markup(task_token)
@@ -1699,14 +2501,29 @@ def send_one(message, msg, client, prefix=""):
             reply(message, "❌ 下载失败，已跳过。")
             return False
 
-        # 上传前：改名为「原名_时间戳」；视频/图片重新编码以改变文件哈希
-        upload_path = prepare_upload_file(file_path, msg_type)
+        if cancel_event.is_set():
+            reply(message, "已取消，临时文件已清理。")
+            return False
 
-        try:
-            bot.edit_message_text(status.chat.id, status.id, "__正在上传__（点下方按钮可取消）",
-                                  reply_markup=markup)
-        except Exception:  # noqa: BLE001
-            pass
+        def on_status(text):
+            """刷新状态文字（转码可能很久，不能一直卡在同一个提示上）。"""
+            try:
+                bot.edit_message_text(status.chat.id, status.id, text,
+                                      reply_markup=markup)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 上传前：改名为「原名_时间戳」；视频/图片重新编码以改变文件哈希。
+        # 没装 ffmpeg 时自动退化为「只改名」，不会卡在转码上。
+        upload_path = prepare_upload_file(file_path, msg_type,
+                                          on_status=on_status,
+                                          cancel_event=cancel_event)
+
+        if cancel_event.is_set():
+            reply(message, "已取消，临时文件已清理。")
+            return False
+
+        on_status("__正在上传__（点下方按钮可取消）")
 
         caption = getattr(msg, "caption", None)
         entities = getattr(msg, "caption_entities", None)
@@ -1793,6 +2610,19 @@ def send_album(message, items, client, prefix=""):
                  public_limit_text()))
         return True
 
+    # 同样先确认账号能传得动：相册里任何一个文件超上限都先试收藏夹中转
+    oversized = [exceeds_upload_limit(item, bot) for item in items]
+    oversized = [size for size in oversized if size]
+    if oversized:
+        log("相册中有文件超过机器人账号上传上限（最大 %s），尝试借用户账号收藏夹中转"
+            % format_size(max(oversized)))
+        reason = deliver_via_saved(message, items, client)
+        if reason is None:
+            return True
+        log("收藏夹中转未成功：%s" % reason)
+        reply(message, upload_limit_text_message(max(oversized), bot, reason))
+        return True
+
     status, task_token, cancel_event = create_cancel_task(
         message, "__正在下载相册__（点下方按钮可取消）")
     markup = cancel_markup(task_token)
@@ -1812,6 +2642,14 @@ def send_album(message, items, client, prefix=""):
                                    cancel_event=cancel_event, gate=gate,
                                    markup=markup),
         )
+
+    def _album_status(text):
+        """刷新相册的状态文字（重新编码可能很久）。"""
+        try:
+            bot.edit_message_text(status.chat.id, status.id, text,
+                                  reply_markup=markup)
+        except Exception:  # noqa: BLE001
+            pass
 
     try:
         # 并发下载（ALBUM_WORKERS 控制并发数，1 为串行）
@@ -1840,7 +2678,12 @@ def send_album(message, items, client, prefix=""):
 
         for item, path in zip(items, paths):
             # 上传前：改名 + 重新编码（图片/视频改变哈希）
-            path = prepare_upload_file(path, get_message_type(item))
+            if cancel_event.is_set():
+                reply(message, "已取消，临时文件已清理。")
+                return True
+            path = prepare_upload_file(path, get_message_type(item),
+                                       on_status=_album_status,
+                                       cancel_event=cancel_event)
             upload_files.append(path)
 
             caption = getattr(item, "caption", None) or ""
@@ -1977,6 +2820,183 @@ def relay_message(message, chat_ref, msg, client, single=False, sent_groups=None
     return False
 
 
+# --------------------------------------------------------------------------- #
+# 7.1 超大文件兜底：借用户自己的账号「收藏夹」中转
+#
+# 机器人账号开不了 Telegram Premium，上传上限永远停在 2000 MiB。
+# 但**用户自己的账号**可能是 Premium（4000 MiB），于是走这条链路：
+#     判断是否登录 → 是否 Premium → 转发/上传到收藏夹 → 收藏夹转发到会话
+# 全程用服务器端转发时不需要真正上传，所以几乎不耗带宽。
+# --------------------------------------------------------------------------- #
+
+def user_account_premium(client):
+    """用户会话对应的账号是不是 Telegram Premium。"""
+    me = _client_me(client)
+    return bool(getattr(me, "is_premium", False))
+
+
+def as_message_list(result):
+    """forward_messages 可能返回单条消息或列表，统一成列表。"""
+    if result is None:
+        return []
+    if isinstance(result, (list, tuple)):
+        return [item for item in result if item is not None]
+    return [result]
+
+
+def upload_one_to_saved(client, item, path, status, cancel_event, markup, prefix):
+    """把下载好的文件用用户会话上传到收藏夹。"""
+    caption = getattr(item, "caption", None)
+    entities = getattr(item, "caption_entities", None)
+    progress = make_progress(status, "已上传", prefix,
+                             cancel_event=cancel_event, markup=markup)
+    msg_type = get_message_type(item)
+
+    if msg_type == "Video":
+        video = item.video
+        return client.send_video(
+            "me", path, caption=caption, caption_entities=entities,
+            duration=getattr(video, "duration", 0),
+            width=getattr(video, "width", None),
+            height=getattr(video, "height", None), progress=progress)
+    if msg_type == "Animation":
+        return client.send_animation("me", path, caption=caption,
+                                     caption_entities=entities, progress=progress)
+    if msg_type == "Audio":
+        audio = item.audio
+        return client.send_audio(
+            "me", path, caption=caption, caption_entities=entities,
+            duration=getattr(audio, "duration", 0),
+            performer=getattr(audio, "performer", None),
+            title=getattr(audio, "title", None), progress=progress)
+    if msg_type == "Voice":
+        return client.send_voice("me", path, caption=caption,
+                                 caption_entities=entities, progress=progress)
+    if msg_type == "Photo":
+        return client.send_photo("me", path, caption=caption,
+                                 caption_entities=entities, progress=progress)
+    if msg_type == "Sticker":
+        return client.send_sticker("me", path)
+    return client.send_document("me", path, caption=caption,
+                                caption_entities=entities, progress=progress)
+
+
+def upload_to_saved(message, msgs, client):
+    """转发不了时：用用户会话下载，再上传到收藏夹。返回收藏夹里的消息列表。"""
+    status, task_token, cancel_event = create_cancel_task(
+        message, "__超大文件：正在下载__（点下方按钮可取消）")
+    markup = cancel_markup(task_token)
+    total = len(msgs)
+    saved = []
+    paths = []
+    try:
+        for index, item in enumerate(msgs, start=1):
+            prefix = "[%d/%d] " % (index, total) if total > 1 else ""
+            path = client.download_media(
+                item, file_name=os.path.join(DOWNLOAD_DIR, ""),
+                progress=make_progress(status, "已下载", prefix,
+                                       cancel_event=cancel_event, markup=markup))
+            if not path:
+                raise RuntimeError("第 %d 个文件下载失败" % index)
+            paths.append(path)
+
+            try:
+                bot.edit_message_text(
+                    status.chat.id, status.id,
+                    "__超大文件：正在上传到收藏夹__（点下方按钮可取消）",
+                    reply_markup=markup)
+            except Exception:  # noqa: BLE001
+                pass
+
+            sent = upload_one_to_saved(client, item, path, status,
+                                       cancel_event, markup, prefix)
+            if sent is None:
+                raise RuntimeError("第 %d 个文件上传失败" % index)
+            saved.append(sent)
+            safe_remove(path)
+
+        log("超大文件：已上传 %d 个文件到收藏夹" % len(saved))
+        return saved
+    except StopTransmission:
+        reply(message, "已取消，临时文件已清理。")
+        return []
+    except Exception as exc:  # noqa: BLE001
+        log("上传到收藏夹失败：%s: %s" % (type(exc).__name__, exc))
+        return []
+    finally:
+        for path in paths:
+            safe_remove(path)
+        finish_cancel_task(task_token)
+        try:
+            bot.delete_messages(message.chat.id, [status.id])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def deliver_via_saved(message, msgs, client):
+    """
+    超大文件（超过机器人账号 2000 MiB 上限）的兜底链路。
+
+      1. 用户必须已登录（有用户会话）
+      2. 该账号必须是 Telegram Premium（否则同样只能传 2000 MiB）
+      3. 先用用户会话把消息**转发到自己的收藏夹**（保护内容转发不了 →
+         下载后用用户会话上传到收藏夹，Premium 上限 4000 MiB）
+      4. 再从收藏夹转发到当前会话
+
+    成功返回 None；失败返回中文原因（用于拼进错误提示）。
+    """
+    if client is None:
+        return "需要先 `/login` 登录一个 Telegram Premium 账号"
+    if client is bot:
+        return "没有可用的用户会话，机器人账号自己也传不了这么大的文件"
+
+    if not user_account_premium(client):
+        return ("你登录的账号不是 **Telegram Premium**，"
+                "单文件上限同样只有 2000 MiB，中转不了。\n"
+                "换一个 Premium 账号 `/login` 后再发一次链接即可。")
+
+    target = relay_target(message)
+    if not target:
+        return "无法确定要把文件发到哪个会话"
+
+    chat_ref = getattr(getattr(msgs[0], "chat", None), "id", None)
+    if not chat_ref:
+        return "无法确定原消息所在的会话"
+
+    ids = [item.id for item in msgs]
+    log("超大文件：尝试用收藏夹中转（%d 条，账号 %s）"
+        % (len(ids), getattr(_client_me(client), "id", "?")))
+
+    # ---- 1) 转发到收藏夹（服务器端转发，不受上传大小限制） ----
+    saved = None
+    try:
+        saved = client.forward_messages("me", chat_ref,
+                                        ids if len(ids) > 1 else ids[0])
+        log("超大文件：已转发到收藏夹")
+    except Exception as exc:  # noqa: BLE001
+        log("转发到收藏夹失败（%s: %s），改为下载后上传"
+            % (type(exc).__name__, exc))
+        saved = upload_to_saved(message, msgs, client)
+
+    saved_msgs = as_message_list(saved)
+    if not saved_msgs:
+        return "转发到收藏夹失败，下载后上传到收藏夹也没有成功"
+
+    # ---- 2) 收藏夹 → 当前会话 ----
+    saved_ids = [item.id for item in saved_msgs]
+    try:
+        client.forward_messages(target, "me",
+                                saved_ids if len(saved_ids) > 1 else saved_ids[0])
+    except Exception as exc:  # noqa: BLE001
+        log("收藏夹转发到会话失败：%s: %s" % (type(exc).__name__, exc))
+        return ("文件已经存进你的**收藏夹**了，但转发到本会话失败"
+                "（`%s: %s`），可以直接去收藏夹查看。"
+                % (type(exc).__name__, exc))
+
+    log("超大文件：收藏夹 → 会话 转发完成")
+    return None
+
+
 def deliver_message(message, msg, chat_ref, client, single=False,
                     sent_groups=None):
     """把已取到的消息发出去：优先转发/复制，不行再下载上传。返回 True 表示已处理。"""
@@ -2093,6 +3113,9 @@ def handle_private(message, link):
 
     sent_groups = set()
     for msg_id in iter_message_ids(message, link):
+        if job_aborted():
+            log("任务已被取消，停止后续消息")
+            return
         process_message_id(message, link.chat, msg_id, client,
                            link.single, sent_groups)
         time.sleep(DELAY)
@@ -2106,6 +3129,9 @@ def handle_bot(message, link):
 
     sent_groups = set()
     for msg_id in iter_message_ids(message, link):
+        if job_aborted():
+            log("任务已被取消，停止后续消息")
+            return
         process_message_id(message, link.chat, msg_id, client,
                            link.single, sent_groups)
         time.sleep(DELAY)
@@ -2130,6 +3156,9 @@ def handle_public(message, link):
     client = "unknown"
 
     for msg_id in iter_message_ids(message, link):
+        if job_aborted():
+            log("任务已被取消，停止后续消息")
+            return
         msg = None
 
         try:
@@ -2242,6 +3271,24 @@ def cmd_id(client, message):
     else:
         lines.append("本机器人只供管理员本人使用。")
     reply(message, "\n".join(lines))
+
+
+@bot.on_message(filters.command(["quere", "queue"]))
+def cmd_queue(client, message):
+    """/quere：查看 / 管理任务队列（仅 OWNER_ID）。"""
+    user = getattr(message, "from_user", None)
+    if not is_owner(getattr(user, "id", None)):
+        reply(message, "❌ **只有管理员可以使用 /quere**\n\n"
+                       "你的用户 ID：`%s`" % (getattr(user, "id", "未知")))
+        return
+
+    text, markup = render_queue_view()
+    try:
+        bot.send_message(message.chat.id, text, reply_markup=markup,
+                         reply_to_message_id=message.id,
+                         disable_web_page_preview=True)
+    except Exception as exc:  # noqa: BLE001
+        reply(message, error_text(exc))
 
 
 @bot.on_message(filters.command("login"))
@@ -2793,7 +3840,8 @@ def _login_check_password(message, state, text):
 
 
 @bot.on_message(filters.text & ~filters.command(
-    ["start", "help", "usage", "id", "login", "logout", "cancel"]))
+    ["start", "help", "usage", "id", "login", "logout", "cancel",
+     "quere", "queue"]))
 def save(client, message):
     """核心入口：登录状态机 + 解析消息里的链接并处理。"""
     if not is_authorized(message):
@@ -2821,15 +3869,7 @@ def save(client, message):
     log("收到任务：用户 %s，%d 个链接：%s"
         % (user_id, len(links), message.text.strip()))
 
-    for link in links:
-        try:
-            dispatch(message, link)
-        except FloodWait as exc:
-            seconds = getattr(exc, "value", 60) or 60
-            reply(message, "触发频率限制，等待 %s 秒后继续。" % seconds)
-            time.sleep(seconds)
-        except Exception as exc:  # noqa: BLE001
-            reply(message, error_text(exc))
+    run_link_queue(message, links)
 
 
 # --------------------------------------------------------------------------- #
@@ -2950,6 +3990,8 @@ def main():
         % (MAX_RANGE or "不限制", DELAY))
     log("相册并发下载数：%d，临时文件最长保留：%d 秒"
         % (ALBUM_WORKERS, TEMP_MAX_AGE))
+    log("同时处理任务数上限：%d（MAX_CONCURRENT），排队提示刷新间隔 %d 秒"
+        % (MAX_CONCURRENT, QUEUE_REFRESH))
     log("非管理员单文件大小上限：%s（PUBLIC_MAX_FILE_SIZE=%d MB，0 为不限制）"
         % (public_limit_text(), PUBLIC_MAX_FILE_SIZE))
 
@@ -2973,6 +4015,9 @@ def main():
         me = bot.get_me()
         BOT_ID = getattr(me, "id", None)
         log("机器人账号：@%s (id=%s)" % (getattr(me, "username", "?"), BOT_ID))
+        log("账号单文件上传上限：%s" % upload_limit_text(bot))
+        if not getattr(me, "is_premium", False):
+            log("        要给机器人账号开通 Telegram Premium 才能上传 4000 MiB 的大文件")
     except Exception as exc:  # noqa: BLE001
         log("获取机器人自身信息失败：%s" % exc)
 
@@ -2982,6 +4027,9 @@ def main():
         log("已同步 %d 个命令到机器人指令菜单" % len(BOT_COMMANDS))
     except Exception as exc:  # noqa: BLE001
         log("同步命令菜单失败：%s" % exc)
+
+    # 队列线程必须在 bot 启动之后起（任务里会调用 bot 的接口）
+    start_queue_workers()
 
     log("机器人开始监听…")
     log("=" * 60)
