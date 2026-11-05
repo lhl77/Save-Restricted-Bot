@@ -53,6 +53,7 @@ from pyrogram.errors import (
 )
 from pyrogram.types import (
     BotCommand,
+    ChatPrivileges,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaAudio,
@@ -278,6 +279,10 @@ ALBUM_WORKERS = max(1, min(_as_int(getenv("ALBUM_WORKERS", 3), 3), MAX_CONCURREN
 # 排队提示「已等待 N 秒 / 前面还有 N 个任务」的刷新间隔（秒）
 QUEUE_REFRESH = max(1, _as_int(getenv("QUEUE_REFRESH", 5), 5))
 
+# 入队后等多久还没开始，就回一条「排队中」（秒）。
+# 立即就能跑的任务不会发提示，避免「刚发出去就被删掉」的闪烁。
+QUEUE_NOTICE_DELAY = max(0, _as_float(getenv("QUEUE_NOTICE_DELAY", 1.0), 1.0))
+
 # 账号单文件上传上限（MiB）：这是 Telegram 的账号能力限制，
 # 普通账号 2000 MiB（约 1.95 GB），Premium 账号 4000 MiB（约 3.91 GB）。
 # 一旦超过，上传阶段 pyrogram 会直接抛
@@ -293,6 +298,17 @@ CLEANUP_INTERVAL = _as_int(getenv("CLEANUP_INTERVAL", 1800), 1800)
 # 直传策略：auto = 先尝试直接转发，再尝试复制，都不行才下载上传
 #         forward = 只尝试转发 / copy = 只尝试复制 / off = 直接下载上传
 RELAY_MODE = str(getenv("RELAY_MODE", "auto")).strip().lower()
+
+# 调试用：强制所有媒体都走「中转群中转」流程（不管文件大小）。
+# 想验证超大文件链路又不想真传 2 GB 文件时把它设为 true。
+FORCE_SAVED_RELAY = _as_bool(getenv("FORCE_SAVED_RELAY", False), False)
+
+# 机器人确实发不出去时（例如账号被限制 / 文件超出账号能力），
+# 是否允许退化为「用你自己的账号」把文件从中转群转发到会话（保底送达）。
+#   true （默认）：一定会送到，但那条消息的发出者会变成你的账号，并会提示原因
+#   false        ：只用机器人发，发不出去就报错并保留中转群副本
+SAVED_RELAY_FALLBACK_USER = _as_bool(
+    getenv("SAVED_RELAY_FALLBACK_USER", True), True)
 
 # 上传前处理：开启后视频/图片会重新编码（改变文件哈希），并统一改名为「原名_时间戳」
 TRANSCODE_MODE = _as_bool(getenv("TRANSCODE_MODE", True), True)
@@ -404,8 +420,19 @@ def parse_proxy(value):
 
 
 PROXY = parse_proxy(getenv("PROXY"))
-# 所有客户端共用的额外参数（目前只有代理）
-CLIENT_EXTRA = {"proxy": PROXY} if PROXY else {}
+
+# 所有客户端共用的额外参数
+CLIENT_EXTRA = {
+    # pyrogram 默认 max_concurrent_transmissions=1：
+    # 同一个 Client 上的上传/下载会被**串行**排队（get_file_semaphore /
+    # save_file_semaphore 都只有 1 个名额）。表现出来就是：
+    # 第一个链接在下载，第二、三个链接卡在「正在下载」一动不动，
+    # 而且因为拿不到名额、进度回调永远不触发，点「取消」也只能停在「取消中…」。
+    # 这里放开到与任务队列一致，才能真正同时下载 / 上传。
+    "max_concurrent_transmissions": MAX_CONCURRENT,
+}
+if PROXY:
+    CLIENT_EXTRA["proxy"] = PROXY
 
 if not TOKEN or not API_HASH or not API_ID_RAW:
     log("缺少必要配置：TOKEN / HASH / ID，请检查环境变量或 config.json")
@@ -1071,8 +1098,9 @@ HELP_TEXT = """**使用说明**
 **3. 相册 / 多文件**
 发相册中任意一条消息的链接，整组一起发送；带 `?single` 只发这一条。
 
-一条消息发多个链接时会依次处理，未开始的会显示「排队中」并实时刷新
-（前方还剩几个任务、已等待多久），点「取消排队」可中止当前任务并跳过剩余链接。
+一条消息发多个链接时会依次处理。**只要任务要排队**（包括一次只发一个链接、
+前面的任务还没做完），就会**回复你那条消息**显示「排队中（第 N 位）」，
+并实时刷新前方任务数和已等待时间；点「取消排队」可随时中止。
 机器人同时最多处理 3 个任务，管理员（`OWNER_ID`）的任务免排队。
 
 **4. 邀请链接**
@@ -1080,8 +1108,11 @@ HELP_TEXT = """**使用说明**
 
 **5. 超大文件（超过 2000 MiB）**
 机器人账号开不了 Telegram 会员，单文件只能传 2000 MiB。
-超过时请 `/login` 绑定一个 **Premium** 账号：机器人会先把文件转发到你的
-**收藏夹**（转发不了就下载后再上传到收藏夹），再从收藏夹转发到本会话。
+超过时请先 `/login` 绑定一个 **Premium** 账号，再在私聊发送 `/group`
+创建一个「只有你和机器人」的中转群（手动建群后可在群里发 `/group_bind` 绑定）。
+建群、拉机器人、设管理员都是用你自己的账号完成的，所以必须先登录；
+机器人会被自动设为**管理员**（需要「删除消息」权限），转发完要删掉群里的暂存。
+之后超大文件会先进中转群，再由**机器人**转发到本会话。
 
 **6. 任务队列（仅管理员）**
 /quere 查看正在处理 / 排队中的任务，可单独取消或全部取消；
@@ -1101,6 +1132,7 @@ BOT_COMMANDS = [
     BotCommand("id", "查看自己的用户 ID"),
     BotCommand("cancel", "取消进行中的登录"),
     BotCommand("quere", "查看 / 取消任务队列（仅管理员）"),
+    BotCommand("group", "创建超大文件中转群"),
 ]
 
 
@@ -1338,7 +1370,7 @@ def upload_limit_text_message(size, client=None, reason=None):
     """
     超过账号上传上限时的中文提示（在下载之前回复）。
 
-    reason：尝试过「收藏夹中转」但失败的原因，会附在下面。
+    reason：尝试过「中转群中转」但失败的原因，会附在下面。
     """
     text = (
         "❌ **文件超过机器人账号的上传上限**\n\n"
@@ -1347,12 +1379,13 @@ def upload_limit_text_message(size, client=None, reason=None):
         "这是账号能力限制，所以已经在**下载之前**就拦下了，不会白占带宽和硬盘。\n\n"
         "机器人账号开不了会员也没关系，这类文件可以借**你自己的账号**中转：\n"
         "1. 用 `/login` 绑定一个开通了 **Telegram Premium** 的账号；\n"
-        "2. 重新发送链接 —— 机器人会先把文件转发到你的**收藏夹**"
-        "（转发不了就下载后再上传到收藏夹），再从收藏夹转发到本会话。"
+        "2. 在私聊里发送 `/group` 创建一个「只有你和机器人」的**中转群**；\n"
+        "3. 重新发送链接 —— 文件会先进中转群（转发不了就下载后再上传），"
+        "再由机器人转发到本会话，最后自动清掉群里的暂存。"
         % (format_size(size), upload_limit_text(client))
     )
     if reason:
-        text += "\n\n本次没有走通收藏夹中转：%s" % reason
+        text += "\n\n本次没有走通中转：%s" % reason
     return text
 
 
@@ -1491,6 +1524,22 @@ def cb_cancel(client, query):
         pass
 
 
+# 手动取消时的统一提示（不要因为取消而报「下载失败」）
+CANCELLED_TEXT = "🛑 **已手动取消**\n\n已停止当前任务，临时文件已清理。"
+
+
+def task_cancelled(cancel_event=None):
+    """任务是否被手动取消：任务级或当前传输级任一置位即算。"""
+    if cancel_event is not None and cancel_event.is_set():
+        return True
+    return job_aborted()
+
+
+def reply_cancelled(message):
+    """回复「已手动取消」。"""
+    reply(message, CANCELLED_TEXT)
+
+
 # --------------------------------------------------------------------------- #
 # 5.2.1 任务队列：所有「链接任务」统一排队
 #
@@ -1544,7 +1593,7 @@ QUEUE_COND = threading.Condition(QUEUE_LOCK)
 QUEUE_PENDING = {"owner": collections.deque(), "user": collections.deque()}
 QUEUE_RUNNING = {}         # {job_token: QueueJob}
 QUEUE_BATCHES = {}         # {batch_token: QueueBatch}
-QUEUE_WORKERS_STARTED = False
+QUEUE_WORKERS = []         # 队列线程（死掉会自动补）
 CURRENT_JOB = threading.local()
 
 
@@ -1590,11 +1639,15 @@ def queue_running_count():
 
 
 def queue_ahead(job):
-    """这个排队中的任务前面还有多少个任务（管理员插队时算 0）。"""
+    """
+    这个排队中的任务前面还有多少个任务。
+
+    「前面」= 正在跑的任务 + 队列里排在自己前面的任务（管理员插队时算 0）。
+    """
     with QUEUE_LOCK:
         if job.state != "queued":
             return 0
-        ahead = 0
+        ahead = len(QUEUE_RUNNING)          # 正在跑的都排在你前面
         if not job.is_owner:
             ahead += len(QUEUE_PENDING["owner"])
         found = False
@@ -1609,22 +1662,42 @@ def queue_ahead(job):
         return ahead
 
 
+def queue_position(job):
+    """这个排队中的任务排在第几位（从 1 开始，管理员插队时自己就是第 1 位）。"""
+    return queue_ahead(job) + 1
+
+
 def queue_notice_text(job):
     """「排队中」提示的文本（会被定时刷新）。"""
     ahead = queue_ahead(job)
     waited = format_duration(max(0, time.time() - job.created))
-    bits = ["同时进行 %d/%d" % (queue_running_count(), MAX_CONCURRENT)]
+    position = ahead + 1
+    bits = []
+    if job.total > 1:
+        bits.append("共 %d 个链接，这是第 %d 个" % (job.total, job.index))
+    bits.append("同时进行 %d/%d" % (queue_running_count(), MAX_CONCURRENT))
     bits.append("前方还有 %d 个任务" % ahead if ahead else "下一个就是它")
     bits.append("已等待 %s" % waited)
-    return "⏳ **排队中**（%d/%d）\n`%s`\n%s" % (
-        job.index, job.total, job_label(job), "｜".join(bits))
+    return "⏳ **排队中**（第 %d 位）\n`%s`\n%s" % (
+        position, job_label(job), "｜".join(bits))
 
 
 def queue_item_message(job):
-    """发一条「排队中」提示（带「取消排队」按钮）。"""
+    """发一条「排队中」提示：回复到原消息上，带「取消排队」按钮。"""
     token = job.batch.token if job.batch is not None else ""
+    text = queue_notice_text(job)
+    message_id = getattr(getattr(job, "message", None), "id", None)
     try:
-        return bot.send_message(job.chat_id, queue_notice_text(job),
+        if message_id:
+            return bot.send_message(job.chat_id, text,
+                                    reply_to_message_id=message_id,
+                                    reply_markup=queue_markup(token),
+                                    disable_web_page_preview=True)
+    except Exception:  # noqa: BLE001
+        # 原消息被删了就不能回复，退化成普通发送
+        pass
+    try:
+        return bot.send_message(job.chat_id, text,
                                 reply_markup=queue_markup(token),
                                 disable_web_page_preview=True)
     except Exception as exc:  # noqa: BLE001
@@ -1685,6 +1758,47 @@ def start_queue_refresher(batch):
                     continue
 
     threading.Thread(target=loop, daemon=True, name="queue-refresh").start()
+
+
+def _post_notice_if_waiting(job):
+    """任务还在排队就回一条「排队中」；已经开始了就不打扰。返回是否发出了提示。"""
+    with QUEUE_LOCK:
+        if job.state != "queued" or job.notice is not None:
+            return False
+    sent = queue_item_message(job)
+    if sent is None:
+        return False
+    with QUEUE_LOCK:
+        if job.state == "queued" and job.notice is None:
+            job.notice = sent
+            return True
+    # 发提示的这段时间里任务已经开始了（或已被取消）：把提示删掉
+    queue_item_started(sent)
+    return False
+
+
+def start_queue_notifier(jobs, batch=None):
+    """
+    入队 QUEUE_NOTICE_DELAY 秒后，仍没开始的任务各回一条「排队中」。
+
+    这样单个链接任务在队列满时也会有回复（不会「发了没反应」），
+    而能立刻开始的任务不会先闪一条提示再被删掉。
+    """
+
+    def loop():
+        if QUEUE_NOTICE_DELAY:
+            time.sleep(QUEUE_NOTICE_DELAY)
+        posted = 0
+        for job in jobs:
+            try:
+                if _post_notice_if_waiting(job):
+                    posted += 1
+            except Exception as exc:  # noqa: BLE001
+                log("发送排队提示失败：%s" % exc)
+        if posted and batch is not None and batch.remaining > 0:
+            start_queue_refresher(batch)
+
+    threading.Thread(target=loop, daemon=True, name="queue-notice").start()
 
 
 def enqueue_job(job):
@@ -1777,11 +1891,12 @@ def finish_batch_job(job):
         return
 
     flush_batch_pending(batch)
-    if batch.skipped:
+    # 只有多个链接的批次才汇总，单个链接已经在提示里说明过了
+    if batch.skipped and len(batch.jobs) > 1:
         total = len(batch.jobs)
         log("队列结束：共 %d 个链接，取消 %d 个" % (total, batch.skipped))
         reply(batch.message,
-              "🚫 **已取消排队**\n\n共 %d 个链接，其中 %d 个未处理。"
+              "🚫 **已取消**\n\n共 %d 个链接，其中 %d 个被取消。"
               % (total, batch.skipped))
 
 
@@ -1830,26 +1945,41 @@ def _queue_take():
 
 
 def _queue_worker(index):
+    """队列线程：任何异常都不能让它死掉（否则后面的任务就永远没人做）。"""
     while True:
-        job = _queue_take()
+        job = None
         try:
+            job = _queue_take()
             run_job(job)
-        except Exception as exc:  # noqa: BLE001
-            log("[错误] 队列线程 %d 异常：%s" % (index, exc))
+        except BaseException as exc:  # noqa: BLE001
+            log("[错误] 队列线程 %d 异常：%s: %s"
+                % (index, type(exc).__name__, exc))
             traceback.print_exc()
+            if job is not None:
+                with QUEUE_LOCK:
+                    QUEUE_RUNNING.pop(job.token, None)
+                    if job.state not in ("done", "cancelled"):
+                        job.state = "done"
+            time.sleep(0.2)
 
 
 def start_queue_workers():
-    """启动 MAX_CONCURRENT 个队列线程（幂等）。"""
-    global QUEUE_WORKERS_STARTED
+    """确保 MAX_CONCURRENT 个队列线程都在跑（幂等，死了会自动补齐）。"""
     with QUEUE_LOCK:
-        if QUEUE_WORKERS_STARTED:
+        alive = [t for t in QUEUE_WORKERS if t.is_alive()]
+        QUEUE_WORKERS[:] = alive
+        missing = MAX_CONCURRENT - len(alive)
+        if missing <= 0:
             return
-        QUEUE_WORKERS_STARTED = True
-    for index in range(1, MAX_CONCURRENT + 1):
-        threading.Thread(target=_queue_worker, args=(index,), daemon=True,
-                         name="queue-worker-%d" % index).start()
-    log("任务队列已启动：最多同时处理 %d 个任务，管理员任务免排队" % MAX_CONCURRENT)
+        for offset in range(missing):
+            index = len(alive) + offset + 1
+            thread = threading.Thread(target=_queue_worker, args=(index,),
+                                      daemon=True,
+                                      name="queue-worker-%d" % index)
+            QUEUE_WORKERS.append(thread)
+            thread.start()
+    log("任务队列线程：%d 个（最多同时处理 %d 个任务，管理员免排队）"
+        % (len(QUEUE_WORKERS), MAX_CONCURRENT))
 
 
 def queue_snapshot():
@@ -1893,8 +2023,8 @@ def render_queue_view():
             mark = "🔄 进行中，已用 %s" % spend
         else:
             spend = format_duration(max(0, time.time() - job.created))
-            ahead = queue_ahead(job)
-            mark = "⏳ 排队中，已等 %s｜前方 %d 个" % (spend, ahead)
+            position = queue_position(job)
+            mark = "⏳ 排队中（第 %d 位），已等 %s" % (position, spend)
         who = "👑 " if job.is_owner else ""
         lines.append("%d. %s`%s`\n　　%s" % (index, who, job_label(job), mark))
 
@@ -1975,34 +2105,33 @@ def run_link_queue(message, links):
 
     - 全局最多 MAX_CONCURRENT 个任务同时跑；
     - OWNER_ID 的任务插到最前面（免排队）；
-    - 数量 > 1 时，所有链接先各回一条「排队中」并实时刷新，
-      轮到它的时候自动删掉提示、换成进度条。
+    - 排队超过 QUEUE_NOTICE_DELAY 秒还没开始的任务，都会**回复它自己那条消息**
+      显示「排队中（第 N 位）」，并实时刷新；轮到它时自动删掉提示、换成进度条。
     """
     links = [link for link in links if link is not None]
     total = len(links)
     if total == 0:
         return
 
+    # 队列线程万一意外退出，这里顺手补上，保证任务不会无人处理
+    start_queue_workers()
+
     user = getattr(message, "from_user", None)
     owner = is_owner(getattr(user, "id", None))
     jobs = [QueueJob(message, link, index, total, None, owner)
             for index, link in enumerate(links, start=1)]
 
-    batch = None
-    if total > 1:
-        batch = QueueBatch(message.chat.id, message, jobs)
-        for job in jobs:
-            job.batch = batch
-        with QUEUE_LOCK:
-            QUEUE_BATCHES[batch.token] = batch
-        # 先把所有「排队中」发出去，再入队：否则第一个任务可能瞬间开始，
-        # 后面的提示就来不及发了。
-        for job in jobs:
-            job.notice = queue_item_message(job)
-        start_queue_refresher(batch)
+    batch = QueueBatch(message.chat.id, message, jobs)
+    for job in jobs:
+        job.batch = batch
+    with QUEUE_LOCK:
+        QUEUE_BATCHES[batch.token] = batch
 
     for job in jobs:
         enqueue_job(job)
+
+    # 延迟发「排队中」：立即就能开始的任务不需要提示
+    start_queue_notifier(jobs, batch)
     return batch
 
 
@@ -2462,18 +2591,31 @@ def send_one(message, msg, client, prefix=""):
     # 下载之前先确认机器人账号能传得动这么大：
     # 普通账号 2000 MiB、Premium 4000 MiB，超了 pyrogram 会在上传时直接报
     # ValueError: Can't upload files bigger than 2000 MiB
+    # FORCE_SAVED_RELAY=true 时（调试用）不管大小都走中转群。
     too_big = exceeds_upload_limit(msg, bot)
-    if too_big:
-        log("文件超过机器人账号上传上限：%s > %s，尝试借用户账号收藏夹中转"
-            % (format_size(too_big), format_size(upload_limit_bytes(bot))))
-        reason = deliver_via_saved(message, [msg], client)
+    force_relay = bool(FORCE_SAVED_RELAY)
+    if too_big or force_relay:
+        if too_big:
+            log("文件超过机器人账号上传上限：%s > %s，尝试用中转群中转"
+                % (format_size(too_big), format_size(upload_limit_bytes(bot))))
+        else:
+            log("FORCE_SAVED_RELAY 已开启：强制走中转群（%s）"
+                % format_size(message_file_size(msg)))
+        reason = deliver_via_relay_group(message, [msg], client)
         if reason is None:
             return True
-        log("收藏夹中转未成功：%s" % reason)
-        reply(message, upload_limit_text_message(too_big, bot, reason))
+        if task_cancelled():
+            reply_cancelled(message)
+            return False
+        log("中转未成功：%s" % reason)
+        if too_big:
+            reply(message, upload_limit_text_message(too_big, bot, reason))
+        else:
+            reply(message, "❌ **中转失败**\n\n%s" % reason)
         return False
 
     if job_aborted():
+        reply_cancelled(message)
         return False
 
     status, task_token, cancel_event = create_cancel_task(
@@ -2491,18 +2633,25 @@ def send_one(message, msg, client, prefix=""):
                                        cancel_event=cancel_event, markup=markup),
             )
         except StopTransmission:
-            reply(message, "已取消，临时文件已清理。")
+            reply_cancelled(message)
             return False
         except Exception as exc:  # noqa: BLE001
-            reply(message, error_text(exc))
+            # 手动取消时 pyrogram 可能抛出各种异常，一律当成「已取消」处理
+            if task_cancelled(cancel_event):
+                reply_cancelled(message)
+            else:
+                reply(message, error_text(exc))
             return False
 
         if not file_path:
-            reply(message, "❌ 下载失败，已跳过。")
+            if task_cancelled(cancel_event):
+                reply_cancelled(message)
+            else:
+                reply(message, "❌ 下载失败，已跳过。")
             return False
 
-        if cancel_event.is_set():
-            reply(message, "已取消，临时文件已清理。")
+        if task_cancelled(cancel_event):
+            reply_cancelled(message)
             return False
 
         def on_status(text):
@@ -2519,8 +2668,8 @@ def send_one(message, msg, client, prefix=""):
                                           on_status=on_status,
                                           cancel_event=cancel_event)
 
-        if cancel_event.is_set():
-            reply(message, "已取消，临时文件已清理。")
+        if task_cancelled(cancel_event):
+            reply_cancelled(message)
             return False
 
         on_status("__正在上传__（点下方按钮可取消）")
@@ -2563,15 +2712,18 @@ def send_one(message, msg, client, prefix=""):
             bot.send_photo(message.chat.id, upload_path, caption=caption,
                            caption_entities=entities, **up)
 
-        if cancel_event.is_set():
-            reply(message, "已取消，临时文件已清理。")
+        if task_cancelled(cancel_event):
+            reply_cancelled(message)
             return False
         return True
     except StopTransmission:
-        reply(message, "已取消，临时文件已清理。")
+        reply_cancelled(message)
         return False
     except Exception as exc:  # noqa: BLE001
-        reply(message, error_text(exc))
+        if task_cancelled(cancel_event):
+            reply_cancelled(message)
+        else:
+            reply(message, error_text(exc))
         return False
     finally:
         safe_remove(file_path)
@@ -2583,6 +2735,18 @@ def send_one(message, msg, client, prefix=""):
             bot.delete_messages(message.chat.id, [status.id])
         except Exception:  # noqa: BLE001
             pass
+
+
+def album_worker_count(total):
+    """
+    相册内部并发下载数。
+
+    pyrogram 的传输名额是「每个客户端」共享的（max_concurrent_transmissions），
+    相册如果把名额占满，别的任务就会卡在等名额，而**等名额期间进度回调不会触发**，
+    点取消也没反应。所以这里按当前同时在跑的任务数把并发收一收。
+    """
+    slots = max(1, MAX_CONCURRENT - max(0, queue_running_count() - 1))
+    return max(1, min(ALBUM_WORKERS, slots, max(1, total)))
 
 
 def send_album(message, items, client, prefix=""):
@@ -2610,17 +2774,26 @@ def send_album(message, items, client, prefix=""):
                  public_limit_text()))
         return True
 
-    # 同样先确认账号能传得动：相册里任何一个文件超上限都先试收藏夹中转
+    # 同样先确认账号能传得动：相册里任何一个文件超上限都先试中转群
     oversized = [exceeds_upload_limit(item, bot) for item in items]
     oversized = [size for size in oversized if size]
-    if oversized:
-        log("相册中有文件超过机器人账号上传上限（最大 %s），尝试借用户账号收藏夹中转"
-            % format_size(max(oversized)))
-        reason = deliver_via_saved(message, items, client)
+    if oversized or FORCE_SAVED_RELAY:
+        if oversized:
+            log("相册中有文件超过机器人账号上传上限（最大 %s），尝试用中转群中转"
+                % format_size(max(oversized)))
+        else:
+            log("FORCE_SAVED_RELAY 已开启：相册强制走中转群")
+        reason = deliver_via_relay_group(message, items, client)
         if reason is None:
             return True
-        log("收藏夹中转未成功：%s" % reason)
-        reply(message, upload_limit_text_message(max(oversized), bot, reason))
+        if task_cancelled():
+            reply_cancelled(message)
+            return True
+        log("中转未成功：%s" % reason)
+        if oversized:
+            reply(message, upload_limit_text_message(max(oversized), bot, reason))
+        else:
+            reply(message, "❌ **中转失败**\n\n%s" % reason)
         return True
 
     status, task_token, cancel_event = create_cancel_task(
@@ -2653,8 +2826,9 @@ def send_album(message, items, client, prefix=""):
 
     try:
         # 并发下载（ALBUM_WORKERS 控制并发数，1 为串行）
-        if ALBUM_WORKERS > 1 and total > 1:
-            with ThreadPoolExecutor(max_workers=min(ALBUM_WORKERS, total)) as pool:
+        album_workers = album_worker_count(total)
+        if album_workers > 1 and total > 1:
+            with ThreadPoolExecutor(max_workers=album_workers) as pool:
                 futures = {pool.submit(_download, index, item): index
                            for index, item in enumerate(items, start=1)}
                 try:
@@ -2678,8 +2852,8 @@ def send_album(message, items, client, prefix=""):
 
         for item, path in zip(items, paths):
             # 上传前：改名 + 重新编码（图片/视频改变哈希）
-            if cancel_event.is_set():
-                reply(message, "已取消，临时文件已清理。")
+            if task_cancelled(cancel_event):
+                reply_cancelled(message)
                 return True
             path = prepare_upload_file(path, get_message_type(item),
                                        on_status=_album_status,
@@ -2707,8 +2881,8 @@ def send_album(message, items, client, prefix=""):
                     performer=getattr(item.audio, "performer", None),
                     title=getattr(item.audio, "title", None)))
 
-        if cancel_event.is_set():
-            reply(message, "已取消，临时文件已清理。")
+        if task_cancelled(cancel_event):
+            reply_cancelled(message)
             return True
 
         try:
@@ -2723,14 +2897,16 @@ def send_album(message, items, client, prefix=""):
         return True
 
     except StopTransmission:
-        reply(message, "已取消，临时文件已清理。")
+        reply_cancelled(message)
         return True
     except Exception as exc:  # noqa: BLE001
-        if cancel_event.is_set():
-            reply(message, "已取消，临时文件已清理。")
+        if task_cancelled(cancel_event):
+            reply_cancelled(message)
             return True
         reply(message, "❌ 相册整体发送失败（%s），改为逐条发送。" % exc)
         for item in items:
+            if task_cancelled(cancel_event):
+                return True
             send_one(message, item, client, prefix)
         return True
     finally:
@@ -2821,13 +2997,364 @@ def relay_message(message, chat_ref, msg, client, single=False, sent_groups=None
 
 
 # --------------------------------------------------------------------------- #
-# 7.1 超大文件兜底：借用户自己的账号「收藏夹」中转
+# 7.1 超大文件兜底：每用户一个「中转群」
 #
 # 机器人账号开不了 Telegram Premium，上传上限永远停在 2000 MiB。
 # 但**用户自己的账号**可能是 Premium（4000 MiB），于是走这条链路：
-#     判断是否登录 → 是否 Premium → 转发/上传到收藏夹 → 收藏夹转发到会话
-# 全程用服务器端转发时不需要真正上传，所以几乎不耗带宽。
+#     判断是否登录 → 是否 Premium → 转发/上传到「中转群」→ 机器人从群转发到会话
+#
+# 中转群：每个用户单独一个，群里**只有该用户和机器人**，用 /group 创建。
+# 用群而不是收藏夹的好处：
+#   - 用户账号和机器人都是成员，转发链路里两个 API 的 from_chat_id 完全一致，
+#     不会出现「同一个私聊在不同账号下 ID 不同」导致的 USER_IS_BOT / 找不到消息；
+#   - 机器人是群成员，转发由机器人完成，发出者一定是机器人。
 # --------------------------------------------------------------------------- #
+
+RELAY_GROUPS_FILE = os.path.join(BASE_DIR, "relay_groups.json")
+RELAY_GROUPS = {}                 # {user_id: relay_chat_id}
+RELAY_GROUPS_LOCK = threading.Lock()
+
+
+def load_relay_groups():
+    """读取 relay_groups.json：{用户ID: 中转群ID}。"""
+    if not os.path.exists(RELAY_GROUPS_FILE):
+        return {}
+    try:
+        with open(RELAY_GROUPS_FILE, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except Exception as exc:  # noqa: BLE001
+        log("读取 relay_groups.json 失败：%s" % exc)
+        return {}
+
+    result = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            text = str(key).strip()
+            if not text.lstrip("-").isdigit():
+                continue
+            try:
+                result[int(text)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return result
+
+
+def save_relay_groups():
+    """原子写入 relay_groups.json。"""
+    with RELAY_GROUPS_LOCK:
+        data = {str(k): v for k, v in RELAY_GROUPS.items()}
+    try:
+        tmp = RELAY_GROUPS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+        os.replace(tmp, RELAY_GROUPS_FILE)
+    except Exception as exc:  # noqa: BLE001
+        log("写入 relay_groups.json 失败：%s" % exc)
+
+
+RELAY_GROUPS = load_relay_groups()
+
+
+def relay_group_of(user_id):
+    """取该用户的中转群 ID；没有返回 None。"""
+    if user_id is None:
+        return None
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    with RELAY_GROUPS_LOCK:
+        return RELAY_GROUPS.get(user_id)
+
+
+def set_relay_group(user_id, chat_id):
+    with RELAY_GROUPS_LOCK:
+        RELAY_GROUPS[int(user_id)] = int(chat_id)
+    save_relay_groups()
+
+
+def relay_group_title(user_id):
+    return "中转站 · %s" % user_id
+
+
+def bot_is_admin(chat_id):
+    """机器人是不是该群的管理员 / 群主。"""
+    try:
+        member = bot.get_chat_member(chat_id, BOT_ID)
+        status = getattr(member, "status", None)
+        return status in (enums.ChatMemberStatus.OWNER,
+                          enums.ChatMemberStatus.ADMINISTRATOR)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def promote_bot_in_group(owner, chat_id, attempts=3):
+    """
+    确保机器人是群管理员（需要 owner 是群主 / 有提升成员权限）。
+
+    机器人需要「删除消息」权限才能清掉中转群里的暂存，
+    「邀请用户」/「置顶」方便后续维护。
+
+    注意：刚把机器人拉进群时立刻提升，Telegram 有时会报
+    USER_NOT_PARTICIPANT（成员关系还没落库），所以这里重试几次。
+    """
+    if not BOT_ID or not chat_id:
+        return False
+
+    if bot_is_admin(chat_id):
+        log("机器人已经是中转群管理员：%s" % chat_id)
+        return True
+
+    try:
+        privileges = ChatPrivileges(
+            can_manage_chat=True,
+            can_delete_messages=True,
+            can_invite_users=True,
+            can_pin_messages=True,
+        )
+    except Exception:  # noqa: BLE001
+        privileges = None
+
+    for index in range(max(1, attempts)):
+        try:
+            owner.promote_chat_member(chat_id, BOT_ID, privileges=privileges)
+        except Exception as exc:  # noqa: BLE001
+            log("设置机器人管理员失败（第 %d 次，%s: %s）"
+                % (index + 1, type(exc).__name__, exc))
+            time.sleep(1 + index)
+            continue
+
+        if bot_is_admin(chat_id):
+            log("已把机器人设为中转群管理员：%s" % chat_id)
+            return True
+        log("已发送提升请求，但暂未生效（第 %d 次）" % (index + 1))
+        time.sleep(1 + index)
+
+    log("[警告] 机器人仍不是中转群管理员：%s" % chat_id)
+    return False
+
+
+def ensure_peer_known(client, chat_id):
+    """
+    确保客户端“认识”这个会话。
+
+    Telegram 的频道/超级群只能靠 (id, access_hash) 定位，
+    用户会话若还没同步过这个群，直接传 int id 会报 PeerIdInvalid。
+    这里先试 get_chat，不行就刷新一次会话列表再试。
+    """
+    if client is None or chat_id is None:
+        return False
+    try:
+        client.get_chat(chat_id)
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        warm_peer_cache(client, force=True)
+        client.get_chat(chat_id)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log("无法解析会话 %s（%s: %s）" % (chat_id, type(exc).__name__, exc))
+        return False
+
+
+_RELAY_PEER_READY = set()      # {(id(client), chat_id)}
+
+
+def ensure_relay_peer(client, chat_id):
+    """一个客户端只预热一次（结果缓存）。"""
+    key = (id(client), chat_id)
+    if key in _RELAY_PEER_READY:
+        return True
+    if ensure_peer_known(client, chat_id):
+        _RELAY_PEER_READY.add(key)
+        return True
+    return False
+
+
+def relay_group_link(chat_id):
+    """尽量取一条中转群的可点击链接（失败返回 None）。"""
+    try:
+        link = bot.export_chat_invite_link(chat_id)
+        if link:
+            return link
+    except Exception:  # noqa: BLE001
+        pass
+    text = str(chat_id)
+    if text.startswith("-100"):
+        return "https://t.me/c/%s" % text[4:]
+    return None
+
+
+def create_relay_group(user_id, message=None):
+    """
+    创建中转群：**你当群主，机器人只拿管理员**。
+
+    固定用你的账号来建（必须先 /login）：
+      pyrogram 里 `create_supergroup` / `add_chat_members` 都是「仅用户可用」，
+      机器人自己建群/拉人不可靠；而且你本来也不希望机器人当群主。
+    流程：你建群 → 你把机器人拉进来 → 你把机器人设为管理员。
+    """
+    title = relay_group_title(user_id)
+
+    client = None
+    if message is not None:
+        client = resolve_session(
+            message, "创建中转群需要先用 /login 绑定你的账号。")
+    if client is None:
+        raise RuntimeError("没有可用的用户会话，请先 /login（建群要用你的账号）")
+
+    chat = client.create_supergroup(title)
+    log("中转群已创建：%s（%s），群主是你的账号" % (chat.id, title))
+
+    try:
+        client.add_chat_members(chat.id, BOT_ID)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            client.delete_supergroup(chat.id)
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError("把机器人拉进中转群失败 `%s: %s`"
+                           % (type(exc).__name__, exc))
+
+    ok = promote_bot_in_group(client, chat.id)
+    return chat.id, ("你是群主，机器人已设为管理员" if ok
+                     else "你是群主，但机器人还不是管理员")
+
+
+def relay_group_status(chat_id, user_id):
+    """检查中转群里的成员 / 管理员状态，返回可读文字列表（用于 /group 自检）。"""
+    lines = []
+
+    try:
+        member = bot.get_chat_member(chat_id, BOT_ID)
+        status = getattr(member, "status", None)
+        admin = status in (enums.ChatMemberStatus.OWNER,
+                           enums.ChatMemberStatus.ADMINISTRATOR)
+        lines.append("机器人：%s" % ("✅ 管理员" if admin
+                                    else "⚠️ 普通成员，建议设为管理员"))
+    except Exception as exc:  # noqa: BLE001
+        lines.append("机器人：❌ 不在群里（%s: %s）"
+                     % (type(exc).__name__, exc))
+
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        status = getattr(member, "status", None)
+        joined = status not in (enums.ChatMemberStatus.LEFT,
+                                enums.ChatMemberStatus.BANNED)
+        lines.append("你：%s" % ("✅ 已加入" if joined else "❌ 不在群里"))
+    except Exception as exc:  # noqa: BLE001
+        lines.append("你：❓ 无法确认（%s）" % type(exc).__name__)
+
+    return lines
+
+
+@bot.on_message(filters.command(["group"]))
+def cmd_group(client, message):
+    """/group：为当前用户在私聊里创建一个专用的「中转群」。"""
+    if not is_authorized(message):
+        send_denied(message)
+        return
+    if message.chat.type != enums.ChatType.PRIVATE:
+        reply(message, "为保护隐私，请在与机器人的**私聊**里发送 /group。")
+        return
+
+    user = message.from_user
+    user_id = getattr(user, "id", None)
+    if not user_id:
+        reply(message, "无法识别你的用户 ID，/group 不可用。")
+        return
+
+    parts = (message.text or "").split(None, 1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if arg == "reset":
+        with RELAY_GROUPS_LOCK:
+            RELAY_GROUPS.pop(int(user_id), None)
+        save_relay_groups()
+        reply(message,
+              "✅ 已清除你的中转群记录（不会删群）。\n"
+              "再发送 `/group` 会重新创建一个中转群。")
+        return
+
+    existing = relay_group_of(user_id)
+    if existing:
+        link = relay_group_link(existing)
+        reply(message,
+              "你已经有一个中转群了。\n\n"
+              "群组 ID：`%s`%s\n%s\n\n"
+              "如果把它删了想重建，请先在群里发送 `/group reset`。"
+              % (existing, ("\n链接：%s" % link) if link else "",
+                 "\n".join(relay_group_status(existing, user_id))))
+        return
+
+    if not SESSIONS.get(user_id):
+        reply(message,
+              "创建中转群需要用**你的账号**（你当群主，机器人只做管理员），"
+              "请先发送 /login 绑定账号后再发 /group。")
+        return
+
+    status = reply(message, "__正在创建中转群…__")
+    try:
+        chat_id, how = create_relay_group(user_id, message)
+    except Exception as exc:  # noqa: BLE001
+        log("创建中转群失败：%s: %s" % (type(exc).__name__, exc))
+        if status is not None:
+            try:
+                bot.delete_messages(message.chat.id, [status.id])
+            except Exception:  # noqa: BLE001
+                pass
+        reply(message,
+              "❌ 创建中转群失败：`%s: %s`\n\n"
+              "先 `/login` 绑定一个账号再试（建群和拉机器人需要你的账号）；"
+              "也可以手动建一个只有你和机器人的群，把机器人拉进去并设为管理员，"
+              "然后在群里发送 `/group_bind` 绑定。"
+              % (type(exc).__name__, exc))
+        return
+
+    set_relay_group(user_id, chat_id)
+    link = relay_group_link(chat_id)
+    log("用户 %s 的中转群已就绪：%s" % (user_id, chat_id))
+    if status is not None:
+        try:
+            bot.delete_messages(message.chat.id, [status.id])
+        except Exception:  # noqa: BLE001
+            pass
+    reply(message,
+          "✅ **中转群已创建**（%s）\n\n"
+          "群组 ID：`%s`%s\n%s\n\n"
+          "以后超过 2000 MiB 的文件会先放进这个群，再由机器人转发给你。\n"
+          "群里只有你和机器人，中转后会自动删除。"
+          % (how, chat_id, ("\n链接：%s" % link) if link else "",
+             "\n".join(relay_group_status(chat_id, user_id))))
+
+
+@bot.on_message(filters.command(["group_bind"]))
+def cmd_group_bind(client, message):
+    """/group_bind：把当前群绑定为我的中转群（手动建群时用）。"""
+    if not is_authorized(message):
+        send_denied(message)
+        return
+    if message.chat.type == enums.ChatType.PRIVATE:
+        reply(message, "请在**中转群**里发送这个命令。")
+        return
+    user_id = getattr(message.from_user, "id", None)
+    if not user_id:
+        return
+    set_relay_group(user_id, message.chat.id)
+    tip = ""
+    try:
+        owner = resolve_session(message)
+    except Exception:  # noqa: BLE001
+        owner = None
+    if owner is not None and promote_bot_in_group(owner, message.chat.id):
+        tip = "\n已把机器人设为管理员。"
+    else:
+        tip = "\n请手动把机器人设为管理员（需要「删除消息」权限）。"
+    log("用户 %s 手动绑定中转群：%s" % (user_id, message.chat.id))
+    reply(message,
+          "✅ 已把这个群设为你的中转群。%s\n\n以后超大文件会先发到这里。" % tip)
+
 
 def user_account_premium(client):
     """用户会话对应的账号是不是 Telegram Premium。"""
@@ -2844,8 +3371,9 @@ def as_message_list(result):
     return [result]
 
 
-def upload_one_to_saved(client, item, path, status, cancel_event, markup, prefix):
-    """把下载好的文件用用户会话上传到收藏夹。"""
+def upload_one_to_relay(client, item, path, relay_chat, status,
+                        cancel_event, markup, prefix):
+    """把下载好的文件用用户会话上传到「中转群」。"""
     caption = getattr(item, "caption", None)
     entities = getattr(item, "caption_entities", None)
     progress = make_progress(status, "已上传", prefix,
@@ -2855,43 +3383,61 @@ def upload_one_to_saved(client, item, path, status, cancel_event, markup, prefix
     if msg_type == "Video":
         video = item.video
         return client.send_video(
-            "me", path, caption=caption, caption_entities=entities,
+            relay_chat, path, caption=caption, caption_entities=entities,
             duration=getattr(video, "duration", 0),
             width=getattr(video, "width", None),
             height=getattr(video, "height", None), progress=progress)
     if msg_type == "Animation":
-        return client.send_animation("me", path, caption=caption,
+        return client.send_animation(relay_chat, path, caption=caption,
                                      caption_entities=entities, progress=progress)
     if msg_type == "Audio":
         audio = item.audio
         return client.send_audio(
-            "me", path, caption=caption, caption_entities=entities,
+            relay_chat, path, caption=caption, caption_entities=entities,
             duration=getattr(audio, "duration", 0),
             performer=getattr(audio, "performer", None),
             title=getattr(audio, "title", None), progress=progress)
     if msg_type == "Voice":
-        return client.send_voice("me", path, caption=caption,
+        return client.send_voice(relay_chat, path, caption=caption,
                                  caption_entities=entities, progress=progress)
     if msg_type == "Photo":
-        return client.send_photo("me", path, caption=caption,
+        return client.send_photo(relay_chat, path, caption=caption,
                                  caption_entities=entities, progress=progress)
     if msg_type == "Sticker":
-        return client.send_sticker("me", path)
-    return client.send_document("me", path, caption=caption,
+        return client.send_sticker(relay_chat, path)
+    return client.send_document(relay_chat, path, caption=caption,
                                 caption_entities=entities, progress=progress)
 
 
-def upload_to_saved(message, msgs, client):
-    """转发不了时：用用户会话下载，再上传到收藏夹。返回收藏夹里的消息列表。"""
-    status, task_token, cancel_event = create_cancel_task(
-        message, "__超大文件：正在下载__（点下方按钮可取消）")
-    markup = cancel_markup(task_token)
+def upload_to_relay(message, msgs, client, relay_chat, status=None,
+                    markup=None, cancel_event=None):
+    """
+    转发不了时：用用户会话下载，再上传到中转群。返回中转群里的消息列表。
+
+    status / markup / cancel_event：调用方已有的状态消息。传进来就复用它，
+    否则自己新建一条并在结束时删掉。
+    """
+    own_status = status is None
+    task_token = None
+    if own_status:
+        status, task_token, cancel_event = create_cancel_task(
+            message, "__超大文件：正在下载__（点下方按钮可取消）")
+        markup = cancel_markup(task_token)
+
     total = len(msgs)
-    saved = []
+    staged = []
     paths = []
     try:
         for index, item in enumerate(msgs, start=1):
             prefix = "[%d/%d] " % (index, total) if total > 1 else ""
+            try:
+                bot.edit_message_text(
+                    status.chat.id, status.id,
+                    "__中转中：正在下载（%d/%d）__（点下方按钮可取消）" % (index, total),
+                    reply_markup=markup)
+            except Exception:  # noqa: BLE001
+                pass
+
             path = client.download_media(
                 item, file_name=os.path.join(DOWNLOAD_DIR, ""),
                 progress=make_progress(status, "已下载", prefix,
@@ -2903,45 +3449,146 @@ def upload_to_saved(message, msgs, client):
             try:
                 bot.edit_message_text(
                     status.chat.id, status.id,
-                    "__超大文件：正在上传到收藏夹__（点下方按钮可取消）",
-                    reply_markup=markup)
+                    "__中转中：正在上传到中转群（%d/%d）__（点下方按钮可取消）"
+                    % (index, total), reply_markup=markup)
             except Exception:  # noqa: BLE001
                 pass
 
-            sent = upload_one_to_saved(client, item, path, status,
+            sent = upload_one_to_relay(client, item, path, relay_chat, status,
                                        cancel_event, markup, prefix)
             if sent is None:
                 raise RuntimeError("第 %d 个文件上传失败" % index)
-            saved.append(sent)
+            staged.append(sent)
             safe_remove(path)
 
-        log("超大文件：已上传 %d 个文件到收藏夹" % len(saved))
-        return saved
+        log("超大文件：已上传 %d 个文件到中转群" % len(staged))
+        return staged, ""
     except StopTransmission:
-        reply(message, "已取消，临时文件已清理。")
-        return []
+        # 由调用方统一回复「已手动取消」，这里不再重复提示
+        log("超大文件：上传到中转群被手动取消")
+        return [], "已取消"
     except Exception as exc:  # noqa: BLE001
-        log("上传到收藏夹失败：%s: %s" % (type(exc).__name__, exc))
-        return []
+        log("上传到中转群失败：%s: %s" % (type(exc).__name__, exc))
+        return [], "%s: %s" % (type(exc).__name__, exc)
     finally:
         for path in paths:
             safe_remove(path)
-        finish_cancel_task(task_token)
+        if own_status:
+            finish_cancel_task(task_token)
+            try:
+                bot.delete_messages(message.chat.id, [status.id])
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def cleanup_relay_messages(client, relay_chat, message_ids):
+    """转发完成后，把中转群里的暂存文件删掉（先试用户会话，再试机器人）。"""
+    if not relay_chat or not message_ids:
+        return
+    for owner, name in ((client, "用户会话"), (bot, "机器人")):
+        if owner is None:
+            continue
         try:
-            bot.delete_messages(message.chat.id, [status.id])
-        except Exception:  # noqa: BLE001
-            pass
+            owner.delete_messages(relay_chat, message_ids)
+            log("已删除中转群里的 %d 个暂存文件（%s）" % (len(message_ids), name))
+            return
+        except Exception as exc:  # noqa: BLE001
+            log("清理中转群暂存失败（%s）：%s: %s"
+                % (name, type(exc).__name__, exc))
 
 
-def deliver_via_saved(message, msgs, client):
+def send_by_file_id(client, target, msg, reply_to=None):
+    """
+    复用已有的 file_id 重新发送（服务端复制，不重新上传），
+    所以不受「单文件 2000 MiB 上传上限」限制。
+
+    注意：file_id 与账号绑定，所以必须用**发送方自己看到的那条消息**里的 file_id。
+    """
+    caption = getattr(msg, "caption", None)
+    entities = getattr(msg, "caption_entities", None)
+    base = {}
+    if reply_to:
+        base["reply_to_message_id"] = reply_to
+
+    for attr in ("document", "video", "audio", "voice", "animation",
+                 "photo", "sticker"):
+        media = getattr(msg, attr, None)
+        if media is None:
+            continue
+        file_id = getattr(media, "file_id", None)
+        if not file_id:
+            return False
+        kw = dict(base)
+        if caption and attr != "sticker":
+            kw["caption"] = caption
+            kw["caption_entities"] = entities
+        if attr == "document":
+            client.send_document(target, file_id, **kw)
+        elif attr == "video":
+            client.send_video(target, file_id,
+                              duration=getattr(media, "duration", 0),
+                              width=getattr(media, "width", None),
+                              height=getattr(media, "height", None), **kw)
+        elif attr == "audio":
+            client.send_audio(target, file_id,
+                              duration=getattr(media, "duration", 0),
+                              performer=getattr(media, "performer", None),
+                              title=getattr(media, "title", None), **kw)
+        elif attr == "voice":
+            client.send_voice(target, file_id, **kw)
+        elif attr == "animation":
+            client.send_animation(target, file_id, **kw)
+        elif attr == "photo":
+            client.send_photo(target, file_id, **kw)
+        elif attr == "sticker":
+            client.send_sticker(target, file_id)
+        return True
+    return False
+
+
+def bot_resend_by_file_id(target_chat, src_chat, staged_msgs, reply_to=None):
+    """
+    机器人转发失败时的兜底：用**机器人视角**重新读取暂存消息，
+    再按 file_id 重新发送（发出者仍然是机器人，且不重新上传）。
+
+    返回 (成功条数, 最后一条错误说明)。
+    """
+    sent = 0
+    last_error = ""
+    for item in staged_msgs:
+        fresh = None
+        try:
+            fresh = bot.get_messages(src_chat, item.id)
+        except Exception as exc:  # noqa: BLE001
+            last_error = "%s: %s" % (type(exc).__name__, exc)
+            log("读取暂存消息失败：%s" % last_error)
+            continue
+        if fresh is None or getattr(fresh, "empty", False):
+            last_error = "取不到暂存消息（id=%s）" % item.id
+            log("读取暂存消息失败：%s" % last_error)
+            continue
+        try:
+            if send_by_file_id(bot, target_chat, fresh, reply_to):
+                sent += 1
+            else:
+                last_error = "暂存消息里没有可复用的媒体"
+        except Exception as exc:  # noqa: BLE001
+            last_error = "%s: %s" % (type(exc).__name__, exc)
+            log("按 file_id 重新发送失败：%s" % last_error)
+    return sent, last_error
+
+
+def deliver_via_relay_group(message, msgs, client):
     """
     超大文件（超过机器人账号 2000 MiB 上限）的兜底链路。
 
       1. 用户必须已登录（有用户会话）
       2. 该账号必须是 Telegram Premium（否则同样只能传 2000 MiB）
-      3. 先用用户会话把消息**转发到自己的收藏夹**（保护内容转发不了 →
-         下载后用用户会话上传到收藏夹，Premium 上限 4000 MiB）
-      4. 再从收藏夹转发到当前会话
+      3. 用户会话把消息**转发到该用户的「中转群」**（保护内容转发不了 →
+         下载后用用户会话上传到中转群，Premium 上限 4000 MiB）
+      4. **由机器人**把中转群里这条转发到当前会话（发出者是机器人；
+         转发失败则退化为服务器端复制 / 按 file_id 重新发送）
+      5. 成功后删掉中转群里的暂存文件
 
     成功返回 None；失败返回中文原因（用于拼进错误提示）。
     """
@@ -2955,46 +3602,156 @@ def deliver_via_saved(message, msgs, client):
                 "单文件上限同样只有 2000 MiB，中转不了。\n"
                 "换一个 Premium 账号 `/login` 后再发一次链接即可。")
 
-    target = relay_target(message)
-    if not target:
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    target_chat = getattr(getattr(message, "chat", None), "id", None)   # 机器人视角
+    user_target = relay_target(message)                                 # 用户会话视角
+    if not target_chat or not user_id or not user_target:
         return "无法确定要把文件发到哪个会话"
+
+    relay_chat = relay_group_of(user_id)
+    if not relay_chat:
+        return ("你还没有中转群。请先在私聊里发送 `/group` 创建一个"
+                "（群里只有你和机器人），然后重新发送链接。")
 
     chat_ref = getattr(getattr(msgs[0], "chat", None), "id", None)
     if not chat_ref:
         return "无法确定原消息所在的会话"
 
     ids = [item.id for item in msgs]
-    log("超大文件：尝试用收藏夹中转（%d 条，账号 %s）"
-        % (len(ids), getattr(_client_me(client), "id", "?")))
+    many = len(ids) > 1
 
-    # ---- 1) 转发到收藏夹（服务器端转发，不受上传大小限制） ----
-    saved = None
+    # 整条链路用同一条状态消息，方便看出卡在哪一步
+    status, task_token, cancel_event = create_cancel_task(
+        message, "__中转中：① 正在放进中转群…__（点下方按钮可取消）")
+    markup = cancel_markup(task_token)
+
+    def set_status(text):
+        try:
+            bot.edit_message_text(status.chat.id, status.id, text,
+                                  reply_markup=markup)
+        except Exception:  # noqa: BLE001
+            pass
+
+    log("超大文件：开始中转（中转群 %s，%d 条，账号 %s）"
+        % (relay_chat, len(ids), getattr(_client_me(client), "id", "?")))
+
     try:
-        saved = client.forward_messages("me", chat_ref,
-                                        ids if len(ids) > 1 else ids[0])
-        log("超大文件：已转发到收藏夹")
-    except Exception as exc:  # noqa: BLE001
-        log("转发到收藏夹失败（%s: %s），改为下载后上传"
-            % (type(exc).__name__, exc))
-        saved = upload_to_saved(message, msgs, client)
+        # ---- 1) 源消息 → 中转群（用户会话） ----
+        ensure_relay_peer(client, relay_chat)
+        ensure_relay_peer(bot, relay_chat)
 
-    saved_msgs = as_message_list(saved)
-    if not saved_msgs:
-        return "转发到收藏夹失败，下载后上传到收藏夹也没有成功"
+        staged = None
+        forward_error = ""
+        upload_error = ""
+        try:
+            staged = client.forward_messages(relay_chat, chat_ref,
+                                             ids if many else ids[0])
+            log("超大文件：① 已转发到中转群")
+        except Exception as exc:  # noqa: BLE001
+            forward_error = "%s: %s" % (type(exc).__name__, exc)
+            log("转发到中转群失败（%s），改为下载后上传" % forward_error)
+            set_status("__中转中：① 正在下载并上传到中转群…__（点下方按钮可取消）")
+            staged, upload_error = upload_to_relay(
+                message, msgs, client, relay_chat, status=status,
+                markup=markup, cancel_event=cancel_event)
 
-    # ---- 2) 收藏夹 → 当前会话 ----
-    saved_ids = [item.id for item in saved_msgs]
-    try:
-        client.forward_messages(target, "me",
-                                saved_ids if len(saved_ids) > 1 else saved_ids[0])
-    except Exception as exc:  # noqa: BLE001
-        log("收藏夹转发到会话失败：%s: %s" % (type(exc).__name__, exc))
-        return ("文件已经存进你的**收藏夹**了，但转发到本会话失败"
-                "（`%s: %s`），可以直接去收藏夹查看。"
+        staged_msgs = as_message_list(staged)
+        if not staged_msgs:
+            if task_cancelled(cancel_event):
+                reply_cancelled(message)
+                return None
+            return ("① 放进中转群失败：%s"
+                    % (upload_error or forward_error or "未知原因"))
+
+        staged_ids = [item.id for item in staged_msgs]
+
+        # ---- 2) 中转群 → 当前会话（机器人发出） ----
+        # 目标：不要「转发自 xxx」的头部，并且回复你最开始发的那条链接。
+        # forward_messages 不支持回复、也一定会带转发头，所以这里以「复制」为主：
+        #   ① copy_message / copy_media_group（无转发头 + 回复原消息）
+        #   ② 按 file_id 重新发送（无转发头 + 回复原消息）
+        #   ③ 转发（兜底，会带转发头）
+        set_status("__中转中：② 机器人正在发送到本会话…__")
+        errors = []
+        delivered = False
+        reply_to = getattr(message, "id", None)
+        grouped = len(staged_ids) > 1
+
+        try:
+            if grouped:
+                bot.copy_media_group(target_chat, relay_chat, staged_ids[0],
+                                     reply_to_message_id=reply_to)
+            else:
+                bot.copy_message(target_chat, relay_chat, staged_ids[0],
+                                 reply_to_message_id=reply_to)
+            delivered = True
+            log("超大文件：② 机器人复制成功（无转发头，已回复原链接）")
+        except Exception as exc:  # noqa: BLE001
+            errors.append("机器人复制失败 `%s: %s`" % (type(exc).__name__, exc))
+            log("机器人复制失败（%s: %s），改为按 file_id 重新发送"
                 % (type(exc).__name__, exc))
 
-    log("超大文件：收藏夹 → 会话 转发完成")
-    return None
+        if not delivered:
+            sent, err = bot_resend_by_file_id(target_chat, relay_chat,
+                                              staged_msgs, reply_to)
+            if sent:
+                delivered = True
+                log("超大文件：② 机器人按 file_id 重新发送成功（%d 条）" % sent)
+            else:
+                errors.append("按 file_id 重发失败：%s" % (err or "未知原因"))
+
+        if not delivered:
+            try:
+                bot.forward_messages(target_chat, relay_chat,
+                                     staged_ids if grouped else staged_ids[0])
+                delivered = True
+                log("超大文件：② 已退化为转发（会带「转发自」头部）")
+            except Exception as exc:  # noqa: BLE001
+                errors.append("机器人转发失败 `%s: %s`"
+                              % (type(exc).__name__, exc))
+                log("机器人转发失败（%s: %s）" % (type(exc).__name__, exc))
+
+        # ---- 2.1) 最后兜底：机器人确实发不出去时，用用户账号自己发 ----
+        delivered_by_user = False
+        if not delivered and SAVED_RELAY_FALLBACK_USER:
+            try:
+                client.forward_messages(user_target, relay_chat,
+                                        staged_ids if len(staged_ids) > 1 else staged_ids[0])
+                delivered = True
+                delivered_by_user = True
+                log("超大文件：机器人发不出去，已改由用户账号转发到会话")
+            except Exception as exc:  # noqa: BLE001
+                errors.append("用户账号兜底也失败 `%s: %s`"
+                              % (type(exc).__name__, exc))
+                log("用户账号兜底失败：%s: %s" % (type(exc).__name__, exc))
+
+        if not delivered:
+            log("中转失败原因：" + "；".join(errors))
+            return ("② 发给本会话失败：\n"
+                    + "\n".join("· " + item for item in errors)
+                    + "\n\n文件已留在中转群 `%s`，可以自己去那转发。" % relay_chat)
+
+        # ---- 3) 删掉中转群里的暂存文件 ----
+        cleanup_relay_messages(client, relay_chat, staged_ids)
+
+        if delivered_by_user:
+            log("超大文件：经中转群中转，最终由用户账号发出")
+            reply(message,
+                  "⚠️ **这条是用你的账号发出的**\n\n"
+                  "机器人账号没能发出这条消息：\n%s\n\n"
+                  "已自动改用你的账号送达（可在 `config.json` 里把 "
+                  "`SAVED_RELAY_FALLBACK_USER` 设为 `false` 关闭这个保底方案）。"
+                  % "\n".join("· " + item for item in errors))
+            return None
+
+        log("超大文件：经中转群中转，已由机器人发出")
+        return None
+    finally:
+        finish_cancel_task(task_token)
+        try:
+            bot.delete_messages(message.chat.id, [status.id])
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def deliver_message(message, msg, chat_ref, client, single=False,
@@ -3841,7 +4598,7 @@ def _login_check_password(message, state, text):
 
 @bot.on_message(filters.text & ~filters.command(
     ["start", "help", "usage", "id", "login", "logout", "cancel",
-     "quere", "queue"]))
+     "quere", "queue", "group", "group_bind"]))
 def save(client, message):
     """核心入口：登录状态机 + 解析消息里的链接并处理。"""
     if not is_authorized(message):
@@ -3986,12 +4743,15 @@ def main():
         log("仅允许管理员使用：%s（想公开则把 ALLOW_PUBLIC 设为 true）" % OWNER_ID)
 
     log("已保存的用户会话：%d 个" % len(SESSIONS))
+    log("已配置的中转群：%d 个（用 /group 创建）" % len(RELAY_GROUPS))
     log("单次最多处理消息数：%s，消息间隔：%s 秒"
         % (MAX_RANGE or "不限制", DELAY))
     log("相册并发下载数：%d，临时文件最长保留：%d 秒"
         % (ALBUM_WORKERS, TEMP_MAX_AGE))
     log("同时处理任务数上限：%d（MAX_CONCURRENT），排队提示刷新间隔 %d 秒"
         % (MAX_CONCURRENT, QUEUE_REFRESH))
+    log("客户端传输名额：%d 个并发上传/下载（pyrogram 默认是 1，会把任务串行化）"
+        % MAX_CONCURRENT)
     log("非管理员单文件大小上限：%s（PUBLIC_MAX_FILE_SIZE=%d MB，0 为不限制）"
         % (public_limit_text(), PUBLIC_MAX_FILE_SIZE))
 

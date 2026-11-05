@@ -34,4 +34,6 @@ config.local.json
 # 用户会话凭证（含完整账号权限，切勿提交！）
 sessions.json
 sessions.json.tmp
+relay_groups.json
+relay_groups.json.tmp
 
