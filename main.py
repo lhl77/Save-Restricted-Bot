@@ -317,8 +317,8 @@ MAX_CONCURRENT = max(1, _as_int(getenv("MAX_CONCURRENT", 3), 3))
 # 不允许超过 MAX_CONCURRENT，否则「同时上传的条数」会突破上限。
 ALBUM_WORKERS = max(1, min(_as_int(getenv("ALBUM_WORKERS", 3), 3), MAX_CONCURRENT))
 
-# 排队提示「已等待 N 秒 / 前面还有 N 个任务」的刷新间隔（秒）
-QUEUE_REFRESH = max(1, _as_int(getenv("QUEUE_REFRESH", 5), 5))
+# 「排队中（第 N 位）」的排位检查间隔（秒）：只有排位变化才会真的去 edit
+QUEUE_REFRESH = max(1, _as_int(getenv("QUEUE_REFRESH", 2), 2))
 
 # 进度 / 状态消息的刷新间隔（秒）。Telegram 对 editMessageText 限得很死，
 # 刷太勤会直接 420 FLOOD_WAIT_X（能罚十几分钟），别调得太小。
@@ -1932,18 +1932,8 @@ def queue_position(job):
 
 
 def queue_notice_text(job):
-    """「排队中」提示的文本（会被定时刷新）。"""
-    ahead = queue_ahead(job)
-    waited = format_duration(max(0, time.time() - job.created))
-    position = ahead + 1
-    bits = []
-    if job.total > 1:
-        bits.append("共 %d 个链接，这是第 %d 个" % (job.total, job.index))
-    bits.append("同时进行 %d/%d" % (queue_running_count(), MAX_CONCURRENT))
-    bits.append("前方还有 %d 个任务" % ahead if ahead else "下一个就是它")
-    bits.append("已等待 %s" % waited)
-    return "⏳ **排队中**（第 %d 位）\n`%s`\n%s" % (
-        position, job_label(job), "｜".join(bits))
+    """「排队中」提示的文本：只显示排在第几位。"""
+    return "⏳ **排队中**（第 %d 位）" % (queue_ahead(job) + 1)
 
 
 def queue_item_message(job):
@@ -1999,21 +1989,71 @@ def flush_batch_pending(batch, reason="已取消排队"):
 
 
 def start_queue_refresher(batch):
-    """定时刷新这一批的「排队中」提示（前方任务数 / 已等待时间）。"""
+    """
+    把这一批里还在排队的「排队中」提示登记到常驻线程。
 
-    def loop():
-        while True:
-            time.sleep(QUEUE_REFRESH)
-            with QUEUE_LOCK:
-                if batch.remaining <= 0:
-                    return
-                alive = [(job, job.notice) for job in batch.jobs
-                         if job.notice is not None and job.state == "queued"]
-            for job, notice in alive:
-                queue_status(notice.chat.id, notice.id, queue_notice_text(job),
-                             queue_markup(batch.token))
+    提示只显示「第 N 位」，只有排位真的变化时才去 edit；
+    以前跟批次绑定的 once 线程一旦提前退出，排位就再也不更新了。
+    """
+    with QUEUE_LOCK:
+        jobs = [job for job in batch.jobs
+                if job.notice is not None and job.state == "queued"]
+    for job in jobs:
+        register_queue_notice(job, job.notice)
 
-    threading.Thread(target=loop, daemon=True, name="queue-refresh").start()
+
+_QUEUE_NOTICES = {}            # {job_token: (job, notice, 上次显示的第几位)}
+_QUEUE_NOTICE_LOCK = threading.Lock()
+_QUEUE_TICKER = [None]
+
+
+def _queue_notice_ticker():
+    """常驻线程：排位变了就改「第 N 位」，排位不变一个字都不发。"""
+    while True:
+        try:
+            time.sleep(min(max(QUEUE_REFRESH, 0.2), 2.0))
+            candidates = []
+            with _QUEUE_NOTICE_LOCK:
+                for token, entry in list(_QUEUE_NOTICES.items()):
+                    job, notice, last_pos = entry
+                    # 已开始 / 已取消 / 提示被删：直接注销
+                    if job.notice is None or job.state != "queued":
+                        _QUEUE_NOTICES.pop(token, None)
+                        continue
+                    candidates.append((token, job, notice, last_pos))
+            for token, job, notice, last_pos in candidates:
+                position = queue_ahead(job) + 1
+                if position == last_pos:
+                    continue
+                with _QUEUE_NOTICE_LOCK:
+                    entry = _QUEUE_NOTICES.get(token)
+                    if entry is None or entry[1] is not notice:
+                        continue
+                    _QUEUE_NOTICES[token] = (job, notice, position)
+                try:
+                    wrap = job.batch.token if job.batch is not None else ""
+                    queue_status(notice.chat.id, notice.id,
+                                 queue_notice_text(job), queue_markup(wrap))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            # 这条线程不能死，否则排位就再也不更新了
+            continue
+
+
+def register_queue_notice(job, notice):
+    """把一条「排队中」提示登记进常驻线程（记住当前排位）。"""
+    if job is None or notice is None:
+        return
+    position = queue_ahead(job) + 1
+    with _QUEUE_NOTICE_LOCK:
+        _QUEUE_NOTICES[job.token] = (job, notice, position)
+        thread = _QUEUE_TICKER[0]
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(target=_queue_notice_ticker, daemon=True,
+                                      name="queue-ticker")
+            thread.start()
+            _QUEUE_TICKER[0] = thread
 
 
 def _post_notice_if_waiting(job):
@@ -2024,10 +2064,14 @@ def _post_notice_if_waiting(job):
     sent = queue_item_message(job)
     if sent is None:
         return False
+    registered = False
     with QUEUE_LOCK:
         if job.state == "queued" and job.notice is None:
             job.notice = sent
-            return True
+            registered = True
+    if registered:
+        register_queue_notice(job, sent)
+        return True
     # 发提示的这段时间里任务已经开始了（或已被取消）：把提示删掉
     queue_item_started(sent)
     return False
@@ -2051,8 +2095,13 @@ def start_queue_notifier(jobs, batch=None):
                     posted += 1
             except Exception as exc:  # noqa: BLE001
                 log("发送排队提示失败：%s" % exc)
-        if posted and batch is not None and batch.remaining > 0:
-            start_queue_refresher(batch)
+        # 不管这条消息里发没发过提示，都把批次里还在排队的提示登记进
+        # 常驻刷新线程（“已等待 N 秒”才会一直走）
+        if batch is not None:
+            try:
+                start_queue_refresher(batch)
+            except Exception as exc:  # noqa: BLE001
+                log("启动排队提示刷新失败：%s" % exc)
 
     threading.Thread(target=loop, daemon=True, name="queue-notice").start()
 
