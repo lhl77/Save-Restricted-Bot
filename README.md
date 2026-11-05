@@ -35,8 +35,6 @@ python -u main.py
   "ALLOW_PUBLIC": false,
   "PUBLIC_MAX_FILE_SIZE": 0,
   "MAX_CONCURRENT": 3,
-  "FORCE_SAVED_RELAY": false,
-  "SAVED_RELAY_FALLBACK_USER": true,
   "MAX_RANGE": 100,
   "DELAY": 3
 }
@@ -50,7 +48,6 @@ python -u main.py
 | `ALLOW_PUBLIC` | **`true` 时对所有人公开可用**；`false`（默认）时只服务 `OWNER_ID` |
 | `PUBLIC_MAX_FILE_SIZE` | **除 `OWNER_ID` 以外的用户，单个文件的大小上限（单位 MB）**；`0`（默认）= 不限制 |
 | `MAX_CONCURRENT` | 同时进行的下载/上传任务数上限，默认 `3` |
-| `SAVED_RELAY_FALLBACK_USER` | 机器人确实发不出去时，是否退化为「用你的账号发送」（默认 `true`，会提示原因）；`false` = 只用机器人发 |
 | `MAX_RANGE` | 批量链接单次最多处理多少条 |
 | `DELAY` | 每条消息之间的间隔秒数 |
 
