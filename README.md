@@ -20,9 +20,17 @@ cd Save-Restricted-Bot
 python3 -m venv .venv && source .venv/bin/activate     # 需要 Python 3.10 ~ 3.13
 pip install -r requirements.txt
 
-# 编辑 config.json，填好 TOKEN / ID / HASH / OWNER_ID
+# 首次运行会自动生成 config.json（复制自 config.json.example）
+# 然后因为缺少 TOKEN / ID / HASH 报错退出，这是正常的
+python -u main.py
+
+# 编辑 config.json，填好 TOKEN / ID / HASH / OWNER_ID，再启动一次
 python -u main.py
 ```
+
+> 仓库里只有 `config.json.example`；真正的 `config.json` 在 `.gitignore` 里，不会被提交。
+> 启动时发现没有 `config.json` 会**自动生成**一份然后**报错退出**，填好再启动即可。
+> 只用环境变量部署（Docker 等）时，缺少 `config.json` 只会生成模板，不会退出。
 
 `config.json` 里的字段说明：
 
@@ -52,7 +60,7 @@ python -u main.py
 | `DELAY` | 每条消息之间的间隔秒数 |
 
 > 键名大小写不敏感（`Allow_Public`、`allow_public` 都能识别）；也可以用环境变量覆盖同名配置。
-> **填好真实密钥后不要把 `config.json` 提交到仓库。**
+> **`config.json` 已加入 `.gitignore`，填好真实密钥也不会被误提交。**
 
 ### 公开使用 / 仅自己用
 
@@ -72,7 +80,7 @@ python -u main.py
 - **管理员免排队**：`OWNER_ID` 的任务直接插到队列最前面
 - **`/quere` 管理队列**：仅管理员可用，列出进行中 / 排队中的任务，可单独取消或全部取消
 - **上传上限预检**：Telegram 普通账号单文件最大 2000 MiB、Premium 4000 MiB；超过机器人上限时**在下载之前**就判断，
-  若你登录的是 Premium 账号且已用 `/group` 建好中转群，会走「中转群」（进群 → **由机器人转发到会话** → 清理暂存），否则提示怎么配置
+  若你登录的是 Premium 账号且已用 `/group` 建好中转群，会走「中转群」（进群 → **由机器人复制到会话**（不带「转发自」头部、并回复原链接）→ 清理暂存），否则提示怎么配置
 - **`/group` 中转群**：先 `/login`，再一条命令为你创建一个「只有你和机器人」的私密群（用你的账号建群、拉机器人进来并自动设为管理员，建好后会自检成员/权限）
 - **指令菜单**：启动时自动把 `/start /help /login /logout /id /cancel /quere` 同步到 Telegram 菜单
 - **私有群组 / 论坛话题**：支持 `t.me/c/<群组ID>/<话题ID>/<消息ID>`（含新群组大 ID 修复）
@@ -83,7 +91,9 @@ python -u main.py
 - **真实设备指纹**：内置多套真实机型画像，按用户 ID 确定性分配（同一账号永远是同一台设备），并修正 pyrogram 把 `system_lang_code` 写死成 `lang_code` 的指纹缺陷
 - **实时进度**：显示已下载大小、百分比与速度，并带「取消」按钮（点击即中断并删临时文件）；
   进度刷新走后台单线程（合并更新），不会占住 pyrogram 的 handler 线程池导致机器人卡住；
-  下载长时间没有新数据时，同一条消息会改成「已用 N 秒」，进度一恢复就自动换回字节进度
+  下载长时间没有新数据时，同一条消息会改成「已用 N 秒」，进度一恢复就自动换回字节进度；
+  刷新间隔 `STATUS_INTERVAL`（默认 5 秒）、全账号编辑间隔 `STATUS_EDIT_GAP`（默认 1.5 秒），
+  撞到 `FLOOD_WAIT` 会自动整体冷却（不会继续撞），冷却结束后补发最新状态
 - **相册并发下载**：`ALBUM_WORKERS` 控制并发数（自动不超过 `MAX_CONCURRENT`），多文件帖可明显提速
 - 全中文提示、可选公开使用（可限制陌生人单文件大小）、链接解析带单元测试
 
@@ -114,6 +124,8 @@ python -u main.py
    （`N` 含正在跑的任务），管理员任务插队到最前；`/quere` 可取消任意任务。
 8. **大小预检**：单文件超过机器人账号上传上限（普通 2000 MiB / Premium 4000 MiB）时在下载前判断——
    用户登录的是 Premium 账号则走「中转群」（中转群 → **由机器人复制发出**（不带「转发自」头部、并回复原链接）→ 删除暂存），否则提示先 `/group`。
+   送达顺序：机器人复制（带回复）→ 机器人复制（不带回复，随后单独补一条回复）→ 按 file_id 重发 →
+   你的账号复制（仍无「转发自」，但发出者变成你自己）→ 机器人转发（唯一会带「转发自」的情况，会附说明）。
    `FORCE_SAVED_RELAY: true` 可强制所有媒体走这条链路，方便小文件调试。
    公开用户的 `PUBLIC_MAX_FILE_SIZE` 限制也在此阶段生效。
 9. **进度与清理**：下载/上传显示大小、百分比与速度；完成后立即删除本地临时文件。

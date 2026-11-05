@@ -1,4 +1,5 @@
 {
+  "_comment": "首次运行会自动把本文件复制成 config.json；请只填写 config.json，不要改这个文件",
   "TOKEN": "",
   "ID": "",
   "HASH": "",

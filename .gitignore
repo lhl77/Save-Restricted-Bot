@@ -23,7 +23,8 @@ blog.md
 # Pyrogram 运行时产生的未知错误日志
 unknown_errors.txt
 
-# 本地私密配置：真实密钥请放这些文件里，不要写进 config.json
+# 本地私密配置：仓库里只有 config.json.example，真实的 config.json 不提交
+config.json
 config.local.json
 
 # 系统 / 编辑器文件

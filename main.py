@@ -80,8 +80,22 @@ BOT_VERSION = "2026.11.05"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+CONFIG_EXAMPLE = os.path.join(BASE_DIR, "config.json.example")
 SESSION_FILE = os.path.join(BASE_DIR, "sessions.json")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+
+# config.json 缺失时的兜底模板（连 config.json.example 都没有的时候用）
+CONFIG_TEMPLATE = {
+    "TOKEN": "",
+    "ID": "",
+    "HASH": "",
+    "OWNER_ID": "",
+    "ALLOW_PUBLIC": False,
+    "PUBLIC_MAX_FILE_SIZE": 0,
+    "MAX_CONCURRENT": 3,
+    "MAX_RANGE": 100,
+    "DELAY": 3,
+}
 
 # 可以作为相册一次性发送的消息类型
 ALBUM_TYPES = {"Photo", "Video", "Document", "Audio"}
@@ -176,6 +190,31 @@ patch_system_lang_code()
 # 1. 配置读取：环境变量 > config.json > 默认值
 # --------------------------------------------------------------------------- #
 
+def ensure_config_file(config_file=None, example_file=None):
+    """
+    config.json 不存在时自动生成一份（优先复制 config.json.example）。
+
+    返回 True 表示「这次运行是刚生成的配置」，调用方据此提示用户去填写、
+    并在缺少必要配置时报错退出；返回 False 表示配置文件本来就在。
+    """
+    config_file = config_file or CONFIG_FILE
+    example_file = example_file or CONFIG_EXAMPLE
+    if os.path.exists(config_file):
+        return False
+    try:
+        if os.path.exists(example_file):
+            shutil.copyfile(example_file, config_file)
+        else:
+            with open(config_file, "w", encoding="utf-8") as fp:
+                json.dump(CONFIG_TEMPLATE, fp, ensure_ascii=False, indent=2)
+                fp.write("\n")
+    except Exception as exc:  # noqa: BLE001
+        log("[错误] 生成 config.json 失败：%s：%s" % (type(exc).__name__, exc))
+        return False
+    log("未找到 config.json，已自动生成：%s" % config_file)
+    return True
+
+
 def _load_config():
     if not os.path.exists(CONFIG_FILE):
         return {}
@@ -188,6 +227,7 @@ def _load_config():
         return {}
 
 
+CONFIG_CREATED = ensure_config_file()
 CONFIG = _load_config()
 
 # config.json 的键名大小写不敏感，Allow_Public / allow_public / ALLOW_PUBLIC 都能认
@@ -279,6 +319,10 @@ ALBUM_WORKERS = max(1, min(_as_int(getenv("ALBUM_WORKERS", 3), 3), MAX_CONCURREN
 
 # 排队提示「已等待 N 秒 / 前面还有 N 个任务」的刷新间隔（秒）
 QUEUE_REFRESH = max(1, _as_int(getenv("QUEUE_REFRESH", 5), 5))
+
+# 进度 / 状态消息的刷新间隔（秒）。Telegram 对 editMessageText 限得很死，
+# 刷太勤会直接 420 FLOOD_WAIT_X（能罚十几分钟），别调得太小。
+STATUS_INTERVAL = max(3.0, _as_float(getenv("STATUS_INTERVAL", 5.0), 5.0))
 
 # 入队后等多久还没开始，就回一条「排队中」（秒）。
 # 立即就能跑的任务不会发提示，避免「刚发出去就被删掉」的闪烁。
@@ -436,8 +480,17 @@ if PROXY:
     CLIENT_EXTRA["proxy"] = PROXY
 
 if not TOKEN or not API_HASH or not API_ID_RAW:
-    log("缺少必要配置：TOKEN / HASH / ID，请检查环境变量或 config.json")
+    if CONFIG_CREATED:
+        log("=" * 60)
+        log("已自动生成配置文件：%s" % CONFIG_FILE)
+        log("请填入 TOKEN / ID / HASH（建议再填上 OWNER_ID），然后重新启动程序。")
+        log("（其中的 _comment 只是说明，可以删掉）")
+        log("=" * 60)
+    else:
+        log("缺少必要配置：TOKEN / HASH / ID，请检查环境变量或 config.json")
     sys.exit(1)
+elif CONFIG_CREATED:
+    log("已自动生成配置文件模板：%s（本次完全使用环境变量启动）" % CONFIG_FILE)
 
 try:
     API_ID = int(API_ID_RAW)
@@ -1428,29 +1481,89 @@ _STATUS_QUEUE = queue.Queue()
 _STATUS_DIRTY = set()        # {(chat_id, message_id)} 已排队
 _STATUS_LATEST = {}          # {(chat_id, message_id): (text, markup)}
 _STATUS_THREAD = None
-_STATUS_ERRORS = []        # 状态刷新失败的异常（只记前几条）
+_STATUS_ERRORS = []          # 状态刷新失败的异常（只记前几条）
+_STATUS_LAST_TEXT = {}       # 每条消息上一次真正发出去的文本（去重，省配额）
+_STATUS_LAST_EDIT = [0.0]    # 全局上一次成功编辑的时间
+_STATUS_PAUSE_UNTIL = [0.0]  # 撞 FloodWait 后要暂停到什么时候
+
+# 「两次状态刷新之间」的全局最小间隔（秒）。
+# Telegram 对 editMessageText 限得很死：同一条消息刷太勤会直接
+# 420 FLOOD_WAIT_X（见过 769 秒的），所以这里既控制单条节奏，
+# 也保证全账号不会同时刷好几条。
+STATUS_EDIT_GAP = max(0.5, _as_float(getenv("STATUS_EDIT_GAP", 1.5), 1.5))
+
+
+def _flood_wait_seconds(exc):
+    """取出 FloodWait 要求等待的秒数。"""
+    try:
+        seconds = int(getattr(exc, "value", 0) or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    return seconds if seconds > 0 else 60
+
+
+def _requeue_status(key, item):
+    """把没发出去的状态放回队列（期间有更新的文字就保留更新的）。"""
+    with _STATUS_LOCK:
+        _STATUS_LATEST.setdefault(key, item)
+        _STATUS_DIRTY.add(key)
+    _STATUS_QUEUE.put(key)
 
 
 def _status_worker():
     while True:
         key = _STATUS_QUEUE.get()
-        with _STATUS_LOCK:
-            item = _STATUS_LATEST.pop(key, None)
-            _STATUS_DIRTY.discard(key)
-        if item is None:
-            continue
-        text, markup = item
-        started = time.time()
         try:
-            bot.edit_message_text(key[0], key[1], text, reply_markup=markup)
+            with _STATUS_LOCK:
+                item = _STATUS_LATEST.pop(key, None)
+                _STATUS_DIRTY.discard(key)
+            if item is None:
+                continue
+
+            # 1) 被 Telegram 限流了：整条队列都停下来，别继续撞
+            remaining = _STATUS_PAUSE_UNTIL[0] - time.time()
+            if remaining > 0:
+                _requeue_status(key, item)
+                time.sleep(min(remaining, 5.0))
+                continue
+
+            text, markup = item
+            # 2) 文字没变就不用再发（同一句话重复编辑也占配额）
+            if _STATUS_LAST_TEXT.get(key) == text:
+                continue
+
+            # 3) 全局节流：几条消息并发时不要挤在一起发
+            gap = STATUS_EDIT_GAP - (time.time() - _STATUS_LAST_EDIT[0])
+            if gap > 0:
+                _requeue_status(key, item)
+                time.sleep(min(gap, STATUS_EDIT_GAP))
+                continue
+
+            started = time.time()
+            try:
+                bot.edit_message_text(key[0], key[1], text, reply_markup=markup)
+            except FloodWait as exc:
+                wait = _flood_wait_seconds(exc)
+                _STATUS_PAUSE_UNTIL[0] = time.time() + wait
+                _requeue_status(key, item)
+                log("[状态刷新暂停] Telegram 要求等待 %d 秒，期间的进度不再刷新"
+                    "（任务本身不受影响）" % wait)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                # 前几次失败打到日志里，方便排查「进度不刷新」
+                if len(_STATUS_ERRORS) < 5:
+                    _STATUS_ERRORS.append(exc)
+                    log("[状态刷新失败] %s: %s" % (type(exc).__name__, exc))
+                continue
+
+            _STATUS_LAST_EDIT[0] = time.time()
+            _STATUS_LAST_TEXT[key] = text
             took = time.time() - started
             if took > 20:
                 log("[状态刷新慢] 单次编辑用了 %.1f 秒，进度会显得卡住" % took)
-        except Exception as exc:  # noqa: BLE001
-            # 前几次失败打到日志里，方便排查「进度不刷新」
-            if len(_STATUS_ERRORS) < 5:
-                _STATUS_ERRORS.append(exc)
-                log("[状态刷新失败] %s: %s" % (type(exc).__name__, exc))
+        except Exception:  # noqa: BLE001
+            # 任何意外都不能让这条线程死掉，否则进度就彻底不刷新了
+            continue
 
 
 def queue_status(chat_id, message_id, text, markup=None):
@@ -1460,6 +1573,8 @@ def queue_status(chat_id, message_id, text, markup=None):
         return
     key = (chat_id, message_id)
     with _STATUS_LOCK:
+        if _STATUS_LATEST.get(key, (None, None))[0] == text:
+            return                      # 内容没变，省一次 API 调用
         _STATUS_LATEST[key] = (text, markup)
         if key in _STATUS_DIRTY:
             return
@@ -1471,7 +1586,7 @@ def queue_status(chat_id, message_id, text, markup=None):
     _STATUS_QUEUE.put(key)
 
 
-def start_status_ticker(setter, render, interval=3.0):
+def start_status_ticker(setter, render, interval=None):
     """
     在耗时步骤里定时刷新状态文字（例如「已用 12 秒」）。
 
@@ -1479,6 +1594,7 @@ def start_status_ticker(setter, render, interval=3.0):
     返回一个 threading.Event，set() 后停止。
     """
     stop = threading.Event()
+    interval = STATUS_INTERVAL if interval is None else interval
     started = time.time()
 
     def loop():
@@ -1493,7 +1609,7 @@ def start_status_ticker(setter, render, interval=3.0):
 
 
 def start_stall_watchdog(chat_id, message_id, gate, render, markup=None,
-                         threshold=12.0, interval=3.0):
+                         threshold=15.0, interval=None):
     """
     进度长时间没动静时接管状态文字，避免看起来像卡死。
 
@@ -1503,6 +1619,7 @@ def start_stall_watchdog(chat_id, message_id, gate, render, markup=None,
     """
     stop = threading.Event()
     started = time.time()
+    interval = STATUS_INTERVAL if interval is None else interval
     gate.setdefault("last_edit", started)
 
     def loop():
@@ -1553,7 +1670,7 @@ def loop_watchdog():
             dump_threads("事件循环响应异常（%.1f 秒）" % elapsed)
 
 
-def make_progress(status_message, label, prefix="", interval=4.0,
+def make_progress(status_message, label, prefix="", interval=None,
                   cancel_event=None, gate=None, markup=None):
     """
     生成上传/下载进度回调：显示实时大小、百分比与速度，并支持取消。
@@ -1564,6 +1681,7 @@ def make_progress(status_message, label, prefix="", interval=4.0,
     gate：可共享的节流容器（相册并发下载时共用一个，避免多条进度互相刷屏）。
     """
     gate = gate if gate is not None else {"last_edit": 0.0}
+    interval = STATUS_INTERVAL if interval is None else interval
     meter = SpeedMeter()
     last_log = [0.0]
     if prefix and not prefix.endswith(" "):
@@ -1667,10 +1785,7 @@ def cb_cancel(client, query):
         query.answer("正在取消…")
     except Exception:  # noqa: BLE001
         pass
-    try:
-        bot.edit_message_text(task["chat_id"], task["message_id"], "__取消中…__")
-    except Exception:  # noqa: BLE001
-        pass
+    queue_status(task["chat_id"], task["message_id"], "__取消中…__")
 
 
 # 手动取消时的统一提示（不要因为取消而报「下载失败」）
@@ -1867,10 +1982,7 @@ def queue_item_started(sent):
 def queue_item_skipped(sent, reason="已取消排队"):
     if sent is None:
         return
-    try:
-        bot.edit_message_text(sent.chat.id, sent.id, "🚫 **%s**" % reason)
-    except Exception:  # noqa: BLE001
-        pass
+    queue_status(sent.chat.id, sent.id, "🚫 **%s**" % reason)
 
 
 def flush_batch_pending(batch, reason="已取消排队"):
@@ -1898,13 +2010,8 @@ def start_queue_refresher(batch):
                 alive = [(job, job.notice) for job in batch.jobs
                          if job.notice is not None and job.state == "queued"]
             for job, notice in alive:
-                try:
-                    bot.edit_message_text(notice.chat.id, notice.id,
-                                          queue_notice_text(job),
-                                          reply_markup=queue_markup(batch.token),
-                                          disable_web_page_preview=True)
-                except Exception:  # noqa: BLE001
-                    continue
+                queue_status(notice.chat.id, notice.id, queue_notice_text(job),
+                             queue_markup(batch.token))
 
     threading.Thread(target=loop, daemon=True, name="queue-refresh").start()
 
@@ -2194,11 +2301,7 @@ def refresh_queue_message(message):
     if message is None:
         return
     text, markup = render_queue_view()
-    try:
-        bot.edit_message_text(message.chat.id, message.id, text,
-                              reply_markup=markup)
-    except Exception:  # noqa: BLE001
-        pass
+    queue_status(message.chat.id, message.id, text, markup)
 
 
 @bot.on_callback_query(filters.regex(r"^qcancel:"))
@@ -2813,11 +2916,7 @@ def send_one(message, msg, client, prefix=""):
 
         def on_status(text):
             """刷新状态文字（转码可能很久，不能一直卡在同一个提示上）。"""
-            try:
-                bot.edit_message_text(status.chat.id, status.id, text,
-                                      reply_markup=markup)
-            except Exception:  # noqa: BLE001
-                pass
+            queue_status(status.chat.id, status.id, text, markup)
 
         # 上传前：改名为「原名_时间戳」；视频/图片重新编码以改变文件哈希。
         # 没装 ffmpeg 时自动退化为「只改名」，不会卡在转码上。
@@ -2975,11 +3074,7 @@ def send_album(message, items, client, prefix=""):
 
     def _album_status(text):
         """刷新相册的状态文字（重新编码可能很久）。"""
-        try:
-            bot.edit_message_text(status.chat.id, status.id, text,
-                                  reply_markup=markup)
-        except Exception:  # noqa: BLE001
-            pass
+        queue_status(status.chat.id, status.id, text, markup)
 
     try:
         # 并发下载（ALBUM_WORKERS 控制并发数，1 为串行）
@@ -3042,12 +3137,8 @@ def send_album(message, items, client, prefix=""):
             reply_cancelled(message)
             return True
 
-        try:
-            bot.edit_message_text(status.chat.id, status.id,
-                                  "__正在上传相册（%d 个文件）__" % len(medias),
-                                  reply_markup=markup)
-        except Exception:  # noqa: BLE001
-            pass
+        queue_status(status.chat.id, status.id,
+                     "__正在上传相册（%d 个文件）__" % len(medias), markup)
 
         bot.send_media_group(message.chat.id, medias,
                              reply_to_message_id=message.id)
@@ -3741,6 +3832,22 @@ def bot_resend_by_file_id(target_chat, src_chat, staged_msgs, reply_to=None):
     return sent, last_error
 
 
+def copy_staged_messages(sender, target_chat, relay_chat, staged_msgs,
+                         reply_to=None):
+    """
+    把中转群里的消息**复制**到目标会话。
+
+    - `copy_message` / `copy_media_group` 是服务端复制，**不会**带
+      「转发自 xxx」头部（`forward_messages` 才会）；
+    - 支持 `reply_to_message_id`，可以顺带回复最开始那条链接。
+    """
+    ids = [item.id for item in staged_msgs]
+    extra = {"reply_to_message_id": reply_to} if reply_to else {}
+    if len(ids) > 1:
+        return sender.copy_media_group(target_chat, relay_chat, ids[0], **extra)
+    return sender.copy_message(target_chat, relay_chat, ids[0], **extra)
+
+
 def deliver_via_relay_group(message, msgs, client):
     """
     超大文件（超过机器人账号 2000 MiB 上限）的兜底链路。
@@ -3749,8 +3856,9 @@ def deliver_via_relay_group(message, msgs, client):
       2. 该账号必须是 Telegram Premium（否则同样只能传 2000 MiB）
       3. 用户会话把消息**转发到该用户的「中转群」**（保护内容转发不了 →
          下载后用用户会话上传到中转群，Premium 上限 4000 MiB）
-      4. **由机器人**把中转群里这条转发到当前会话（发出者是机器人；
-         转发失败则退化为服务器端复制 / 按 file_id 重新发送）
+      4. **由机器人**把中转群里这条送到当前会话：优先 `copy_message`
+         （无「转发自」头部，并回复你最开始发的那条链接）；复制不了才退化为
+         按 file_id 重发 / 用户账号复制 / 转发
       5. 成功后删掉中转群里的暂存文件
 
     成功返回 None；失败返回中文原因（用于拼进错误提示）。
@@ -3789,11 +3897,7 @@ def deliver_via_relay_group(message, msgs, client):
     markup = cancel_markup(task_token)
 
     def set_status(text):
-        try:
-            bot.edit_message_text(status.chat.id, status.id, text,
-                                  reply_markup=markup)
-        except Exception:  # noqa: BLE001
-            pass
+        queue_status(status.chat.id, status.id, text, markup)
 
     log("超大文件：开始中转（中转群 %s，%d 条，账号 %s）"
         % (relay_chat, len(ids), getattr(_client_me(client), "id", "?")))
@@ -3836,49 +3940,89 @@ def deliver_via_relay_group(message, msgs, client):
 
         staged_ids = [item.id for item in staged_msgs]
 
-        # ---- 2) 中转群 → 当前会话（机器人发出） ----
-        # 目标：不要「转发自 xxx」的头部，并且回复你最开始发的那条链接。
-        # forward_messages 不支持回复、也一定会带转发头，所以这里以「复制」为主：
-        #   ① copy_message / copy_media_group（无转发头 + 回复原消息）
-        #   ② 按 file_id 重新发送（无转发头 + 回复原消息）
-        #   ③ 转发（兜底，会带转发头）
+        # ---- 2) 中转群 → 当前会话（机器人发出，且不要「转发自 xxx」） ----
+        # 送达优先级（越靠前越「干净」，且尽量让发出者是机器人）：
+        #   ① 机器人复制 + 回复原链接   → 无转发头、有回复（最理想）
+        #   ② 机器人复制（不带回复）    → 无转发头；随后单独补一条回复说明
+        #   ③ 机器人按 file_id 重新发送 → 无转发头（大文件会因 2000 MiB 上限失败）
+        #   ④ 用户账号复制              → 无转发头，但发出者变成你自己
+        #   ⑤ 机器人转发                → 一定会带「转发自」，仅当前面全挂
         step_started = time.time()
         send_base = "__中转中：② 机器人正在发送到本会话…（已用 %s）__"
         set_status(send_base % "0 秒")
         ticker2 = start_status_ticker(set_status, lambda took: send_base % took)
         errors = []
         delivered = False
+        delivered_by_user = False
+        replied = False          # 送达的媒体本身有没有「回复原链接」
+        no_header = True         # 送达的媒体有没有「转发自 xxx」
         reply_to = getattr(message, "id", None)
         grouped = len(staged_ids) > 1
 
+        # ① 机器人复制 + 回复原链接
         try:
-            if grouped:
-                bot.copy_media_group(target_chat, relay_chat, staged_ids[0],
-                                     reply_to_message_id=reply_to)
-            else:
-                bot.copy_message(target_chat, relay_chat, staged_ids[0],
-                                 reply_to_message_id=reply_to)
-            delivered = True
-            log("超大文件：② 机器人复制成功（无转发头，已回复原链接）")
+            copy_staged_messages(bot, target_chat, relay_chat, staged_msgs,
+                                 reply_to)
+            delivered = replied = True
+            log("超大文件：② 机器人复制成功（无「转发自」，已回复原链接）")
         except Exception as exc:  # noqa: BLE001
-            errors.append("机器人复制失败 `%s: %s`" % (type(exc).__name__, exc))
-            log("机器人复制失败（%s: %s），改为按 file_id 重新发送"
+            errors.append("机器人复制（带回复）失败 `%s: %s`"
+                          % (type(exc).__name__, exc))
+            log("机器人复制失败（%s: %s），去掉回复再试一次"
                 % (type(exc).__name__, exc))
 
+        # ② 机器人复制（不带回复）——带 reply 偶发失败时还能保住「无转发头」
+        if not delivered:
+            try:
+                copy_staged_messages(bot, target_chat, relay_chat, staged_msgs)
+                delivered = True
+                log("超大文件：② 机器人复制成功（无「转发自」，回复稍后单独补）")
+            except Exception as exc:  # noqa: BLE001
+                errors.append("机器人复制失败 `%s: %s`"
+                              % (type(exc).__name__, exc))
+                log("机器人复制（不带回复）也失败（%s: %s），改为按 file_id 重发"
+                    % (type(exc).__name__, exc))
+
+        # ③ 按 file_id 重新发送（发出者仍是机器人）
         if not delivered:
             sent, err = bot_resend_by_file_id(target_chat, relay_chat,
                                               staged_msgs, reply_to)
             if sent:
-                delivered = True
+                delivered = replied = True
                 log("超大文件：② 机器人按 file_id 重新发送成功（%d 条）" % sent)
             else:
                 errors.append("按 file_id 重发失败：%s" % (err or "未知原因"))
 
+        # ④ 用户账号复制：仍然没有「转发自」，只是发出者变成你自己
+        if not delivered and SAVED_RELAY_FALLBACK_USER:
+            try:
+                copy_staged_messages(client, user_target, relay_chat,
+                                     staged_msgs, reply_to)
+                delivered = delivered_by_user = replied = True
+                log("超大文件：机器人发不出去，已改由用户账号复制到会话（无「转发自」）")
+            except Exception as exc:  # noqa: BLE001
+                errors.append("用户账号复制失败 `%s: %s`"
+                              % (type(exc).__name__, exc))
+                log("用户账号复制失败（%s: %s），改为用户账号转发"
+                    % (type(exc).__name__, exc))
+                try:
+                    client.forward_messages(
+                        user_target, relay_chat,
+                        staged_ids if grouped else staged_ids[0])
+                    delivered = delivered_by_user = True
+                    no_header = False
+                    log("超大文件：已改由用户账号转发（会带「转发自」）")
+                except Exception as exc2:  # noqa: BLE001
+                    errors.append("用户账号转发也失败 `%s: %s`"
+                                  % (type(exc2).__name__, exc2))
+
+        # ⑤ 最后兜底：机器人转发（一定会带「转发自」）
         if not delivered:
             try:
                 bot.forward_messages(target_chat, relay_chat,
                                      staged_ids if grouped else staged_ids[0])
                 delivered = True
+                no_header = False
                 log("超大文件：② 已退化为转发（会带「转发自」头部）")
             except Exception as exc:  # noqa: BLE001
                 errors.append("机器人转发失败 `%s: %s`"
@@ -3886,21 +4030,24 @@ def deliver_via_relay_group(message, msgs, client):
                 log("机器人转发失败（%s: %s）" % (type(exc).__name__, exc))
 
         ticker2.set()
-        log("超大文件：② 发送步骤完成（用时 %.1f 秒）" % (time.time() - step_started))
+        log("超大文件：② 发送步骤完成（用时 %.1f 秒，无「转发自」=%s，已回复=%s）"
+            % (time.time() - step_started, no_header, replied))
 
-        # ---- 2.1) 最后兜底：机器人确实发不出去时，用用户账号自己发 ----
-        delivered_by_user = False
-        if not delivered and SAVED_RELAY_FALLBACK_USER:
+        # 媒体本身没能带回复时，单独回复原链接补一句说明
+        if delivered and not replied and reply_to:
             try:
-                client.forward_messages(user_target, relay_chat,
-                                        staged_ids if len(staged_ids) > 1 else staged_ids[0])
-                delivered = True
-                delivered_by_user = True
-                log("超大文件：机器人发不出去，已改由用户账号转发到会话")
+                if no_header:
+                    note = "⬆️ 上面这条就是你要的文件。"
+                else:
+                    note = ("⬆️ 上面这条就是你要的文件。\n"
+                            "超大文件只能以「转发」形式送达，所以带「转发自」标记，文件内容完全一样。")
+                if delivered_by_user:
+                    note += "\n（这条是用你自己的账号发出的）"
+                bot.send_message(target_chat, note, reply_to_message_id=reply_to)
+                replied = True
+                log("超大文件：② 已单独回复原链接说明")
             except Exception as exc:  # noqa: BLE001
-                errors.append("用户账号兜底也失败 `%s: %s`"
-                              % (type(exc).__name__, exc))
-                log("用户账号兜底失败：%s: %s" % (type(exc).__name__, exc))
+                log("补回复原链接失败：%s: %s" % (type(exc).__name__, exc))
 
         if not delivered:
             log("中转失败原因：" + "；".join(errors))

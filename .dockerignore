@@ -13,6 +13,7 @@ venv/
 *.session-journal
 sessions.json
 sessions.json.tmp
+config.json
 config.local.json
 
 # 运行时产物
