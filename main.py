@@ -20,6 +20,7 @@ import collections
 import inspect
 import json
 import os
+import queue
 import random
 import re
 import shutil
@@ -1411,6 +1412,147 @@ class SpeedMeter:
         return self.speed
 
 
+# --------------------------------------------------------------------------- #
+# 5.1.1 非阻塞状态刷新
+#
+# 进度回调是在 pyrogram 的 **handler 线程池** 里被调用的
+# （client.executor，同时还要用来分发 /start 这类更新）。
+# 如果回调里直接调 bot.edit_message_text()，就会在那个线程上阻塞等待事件循环，
+# 一旦慢一点或撞上限流，线程池被占满 → 所有新消息（包括 /start）都排不上号，
+# 表现就是「下载卡住、进度不刷新、机器人不理人」。
+# 所以这里改成：回调只把最新状态丢进队列，真正的 API 调用放到单线程里做。
+# --------------------------------------------------------------------------- #
+
+_STATUS_LOCK = threading.Lock()
+_STATUS_QUEUE = queue.Queue()
+_STATUS_DIRTY = set()        # {(chat_id, message_id)} 已排队
+_STATUS_LATEST = {}          # {(chat_id, message_id): (text, markup)}
+_STATUS_THREAD = None
+_STATUS_ERRORS = []        # 状态刷新失败的异常（只记前几条）
+
+
+def _status_worker():
+    while True:
+        key = _STATUS_QUEUE.get()
+        with _STATUS_LOCK:
+            item = _STATUS_LATEST.pop(key, None)
+            _STATUS_DIRTY.discard(key)
+        if item is None:
+            continue
+        text, markup = item
+        started = time.time()
+        try:
+            bot.edit_message_text(key[0], key[1], text, reply_markup=markup)
+            took = time.time() - started
+            if took > 20:
+                log("[状态刷新慢] 单次编辑用了 %.1f 秒，进度会显得卡住" % took)
+        except Exception as exc:  # noqa: BLE001
+            # 前几次失败打到日志里，方便排查「进度不刷新」
+            if len(_STATUS_ERRORS) < 5:
+                _STATUS_ERRORS.append(exc)
+                log("[状态刷新失败] %s: %s" % (type(exc).__name__, exc))
+
+
+def queue_status(chat_id, message_id, text, markup=None):
+    """把「刷新状态文字」丢给后台单线程执行（立即返回，绝不阻塞调用方）。"""
+    global _STATUS_THREAD
+    if not chat_id or not message_id:
+        return
+    key = (chat_id, message_id)
+    with _STATUS_LOCK:
+        _STATUS_LATEST[key] = (text, markup)
+        if key in _STATUS_DIRTY:
+            return
+        _STATUS_DIRTY.add(key)
+        if _STATUS_THREAD is None or not _STATUS_THREAD.is_alive():
+            _STATUS_THREAD = threading.Thread(target=_status_worker, daemon=True,
+                                              name="status-editor")
+            _STATUS_THREAD.start()
+    _STATUS_QUEUE.put(key)
+
+
+def start_status_ticker(setter, render, interval=3.0):
+    """
+    在耗时步骤里定时刷新状态文字（例如「已用 12 秒」）。
+
+    转发/复制是服务端操作，拿不到字节进度，但至少要让人知道没卡死。
+    返回一个 threading.Event，set() 后停止。
+    """
+    stop = threading.Event()
+    started = time.time()
+
+    def loop():
+        while not stop.wait(interval):
+            try:
+                setter(render(format_duration(time.time() - started)))
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=loop, daemon=True, name="status-ticker").start()
+    return stop
+
+
+def start_stall_watchdog(chat_id, message_id, gate, render, markup=None,
+                         threshold=12.0, interval=3.0):
+    """
+    进度长时间没动静时接管状态文字，避免看起来像卡死。
+
+    gate 是 make_progress 用的节流容器，里面的 last_edit 就是「上一次真正
+    刷新文字的时间」。超过 threshold 秒没刷新，就改成「已用 N 秒」，
+    真进度一恢复就自动让位（进度刷新会覆盖文字）。
+    """
+    stop = threading.Event()
+    started = time.time()
+    gate.setdefault("last_edit", started)
+
+    def loop():
+        while not stop.wait(interval):
+            try:
+                if time.time() - gate.get("last_edit", started) <= threshold:
+                    continue
+                queue_status(chat_id, message_id,
+                             render(format_duration(time.time() - started)),
+                             markup)
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=loop, daemon=True, name="status-stall").start()
+    return stop
+
+
+def dump_threads(reason=""):
+    """把所有线程的调用栈打出来（排查卡死用）。"""
+    log("=" * 60)
+    log("线程栈快照 %s（共 %d 个线程）" % (reason, threading.active_count()))
+    frames = sys._current_frames()
+    for thread in threading.enumerate():
+        frame = frames.get(thread.ident)
+        if frame is None:
+            continue
+        try:
+            stack = "".join(traceback.format_stack(frame))
+        except Exception:  # noqa: BLE001
+            stack = "（无法读取）"
+        log("--- 线程 %s (daemon=%s) ---\n%s"
+            % (thread.name, thread.daemon, stack))
+    log("=" * 60)
+
+
+def loop_watchdog():
+    """每 30 秒探一次事件循环；卡住就自动打印所有线程栈。"""
+    while True:
+        time.sleep(30)
+        started = time.time()
+        try:
+            bot.get_me()
+        except Exception:  # noqa: BLE001
+            pass
+        elapsed = time.time() - started
+        if elapsed >= 10:
+            log("[警告] 事件循环疑似卡住 %.1f 秒，自动打印线程栈：" % elapsed)
+            dump_threads("事件循环响应异常（%.1f 秒）" % elapsed)
+
+
 def make_progress(status_message, label, prefix="", interval=4.0,
                   cancel_event=None, gate=None, markup=None):
     """
@@ -1423,6 +1565,7 @@ def make_progress(status_message, label, prefix="", interval=4.0,
     """
     gate = gate if gate is not None else {"last_edit": 0.0}
     meter = SpeedMeter()
+    last_log = [0.0]
     if prefix and not prefix.endswith(" "):
         prefix += " "
 
@@ -1432,10 +1575,6 @@ def make_progress(status_message, label, prefix="", interval=4.0,
 
         speed = meter.update(current)
         now = time.time()
-        finished = bool(total) and current >= total
-        if not finished and now - gate["last_edit"] < interval:
-            return
-        gate["last_edit"] = now
 
         if total:
             detail = "%s / %s（%.1f%%）" % (
@@ -1443,17 +1582,27 @@ def make_progress(status_message, label, prefix="", interval=4.0,
         else:
             detail = format_size(current)
 
+        # 日志里每 30 秒也打一条：确认进度回调到底有没有在跑
+        if now - last_log[0] >= 30:
+            last_log[0] = now
+            log("进度[%s]：%s%s" % (label, prefix, detail))
+
+        # 第一次一定刷（不然要等满 interval 才出现进度），之后按 interval 节流
+        finished = bool(total) and current >= total
+        if (not finished and gate.get("painted")
+                and now - gate["last_edit"] < interval):
+            return
+        gate["last_edit"] = now
+        gate["painted"] = True
+
         text = "__%s__：**%s%s**" % (label, prefix, detail)
         if speed > 0 and not finished:
             text += "｜%s/s" % format_size(speed)
 
-        try:
-            # 注意：Bot API 的 editMessageText 在未提供 reply_markup 时会
-            # 把已有的内联键盘删掉，所以这里必须每次都带上取消按钮。
-            bot.edit_message_text(status_message.chat.id, status_message.id, text,
-                                  reply_markup=markup)
-        except Exception:  # noqa: BLE001
-            pass
+        # 注意：editMessageText 没带 reply_markup 时会把已有的内联键盘删掉，
+        # 所以每次都要带上取消按钮。
+        # 这里只入队，不直接调 API —— 否则会占住 pyrogram 的 handler 线程池。
+        queue_status(status_message.chat.id, status_message.id, text, markup)
 
     return _progress
 
@@ -2624,13 +2773,19 @@ def send_one(message, msg, client, prefix=""):
     file_path = None
     upload_path = None
     thumb = None
+    gate = {}
     try:
+        stalled = start_stall_watchdog(
+            status.chat.id, status.id, gate,
+            lambda took: "__正在下载…（已用 %s，进度一恢复就自动刷新）__"
+                         "（点下方按钮可取消）" % took, markup)
         try:
             file_path = client.download_media(
                 msg,
                 file_name=os.path.join(DOWNLOAD_DIR, ""),
                 progress=make_progress(status, "已下载", prefix,
-                                       cancel_event=cancel_event, markup=markup),
+                                       cancel_event=cancel_event, gate=gate,
+                                       markup=markup),
             )
         except StopTransmission:
             reply_cancelled(message)
@@ -2642,6 +2797,8 @@ def send_one(message, msg, client, prefix=""):
             else:
                 reply(message, error_text(exc))
             return False
+        finally:
+            stalled.set()
 
         if not file_path:
             if task_cancelled(cancel_event):
@@ -3136,11 +3293,11 @@ def promote_bot_in_group(owner, chat_id, attempts=3):
 
 def ensure_peer_known(client, chat_id):
     """
-    确保客户端“认识”这个会话。
+    快速探测客户端是否认识这个会话。
 
-    Telegram 的频道/超级群只能靠 (id, access_hash) 定位，
-    用户会话若还没同步过这个群，直接传 int id 会报 PeerIdInvalid。
-    这里先试 get_chat，不行就刷新一次会话列表再试。
+    注意：**不要**在这里调 get_dialogs()。账号在几百个会话里时，
+    拉全量会话列表可能要几十秒甚至更久，会把「① 放进中转群」卡死在那一步。
+    解析不出来就丢到后台慢慢预热，下一次自然就好了。
     """
     if client is None or chat_id is None:
         return False
@@ -3149,13 +3306,16 @@ def ensure_peer_known(client, chat_id):
         return True
     except Exception:  # noqa: BLE001
         pass
-    try:
-        warm_peer_cache(client, force=True)
-        client.get_chat(chat_id)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        log("无法解析会话 %s（%s: %s）" % (chat_id, type(exc).__name__, exc))
-        return False
+
+    # 后台预热，不阻塞当前任务
+    def _warm():
+        try:
+            warm_peer_cache(client, force=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_warm, daemon=True, name="peer-warm").start()
+    return False
 
 
 _RELAY_PEER_READY = set()      # {(id(client), chat_id)}
@@ -3427,32 +3587,35 @@ def upload_to_relay(message, msgs, client, relay_chat, status=None,
     total = len(msgs)
     staged = []
     paths = []
+    gate = {}
     try:
         for index, item in enumerate(msgs, start=1):
             prefix = "[%d/%d] " % (index, total) if total > 1 else ""
-            try:
-                bot.edit_message_text(
-                    status.chat.id, status.id,
-                    "__中转中：正在下载（%d/%d）__（点下方按钮可取消）" % (index, total),
-                    reply_markup=markup)
-            except Exception:  # noqa: BLE001
-                pass
+            # 走 queue_status，别直连 API —— 否则会和后台进度刷新互相覆盖
+            queue_status(status.chat.id, status.id,
+                         "__中转中：① 正在下载（%d/%d）__（点下方按钮可取消）"
+                         % (index, total), markup)
 
-            path = client.download_media(
-                item, file_name=os.path.join(DOWNLOAD_DIR, ""),
-                progress=make_progress(status, "已下载", prefix,
-                                       cancel_event=cancel_event, markup=markup))
+            stalled = start_stall_watchdog(
+                status.chat.id, status.id, gate,
+                lambda took: "__中转中：① 正在下载…（已用 %s，进度一恢复就自动"
+                             "刷新）__（点下方按钮可取消）" % took,
+                markup)
+            try:
+                path = client.download_media(
+                    item, file_name=os.path.join(DOWNLOAD_DIR, ""),
+                    progress=make_progress(status, "已下载", prefix,
+                                           cancel_event=cancel_event,
+                                           gate=gate, markup=markup))
+            finally:
+                stalled.set()
             if not path:
                 raise RuntimeError("第 %d 个文件下载失败" % index)
             paths.append(path)
 
-            try:
-                bot.edit_message_text(
-                    status.chat.id, status.id,
-                    "__中转中：正在上传到中转群（%d/%d）__（点下方按钮可取消）"
-                    % (index, total), reply_markup=markup)
-            except Exception:  # noqa: BLE001
-                pass
+            queue_status(status.chat.id, status.id,
+                         "__中转中：① 正在上传到中转群（%d/%d）__"
+                         "（点下方按钮可取消）" % (index, total), markup)
 
             sent = upload_one_to_relay(client, item, path, relay_chat, status,
                                        cancel_event, markup, prefix)
@@ -3644,9 +3807,17 @@ def deliver_via_relay_group(message, msgs, client):
         forward_error = ""
         upload_error = ""
         try:
-            staged = client.forward_messages(relay_chat, chat_ref,
-                                             ids if many else ids[0])
-            log("超大文件：① 已转发到中转群")
+            step_started = time.time()
+            forward_base = "__中转中：① 正在放进中转群…（已用 %s，可点下方按钮取消）__"
+            set_status(forward_base % "0 秒")
+            ticker = start_status_ticker(set_status, lambda took: forward_base % took)
+            try:
+                staged = client.forward_messages(relay_chat, chat_ref,
+                                                 ids if many else ids[0])
+            finally:
+                ticker.set()
+            log("超大文件：① 已转发到中转群（用时 %.1f 秒）"
+                % (time.time() - step_started))
         except Exception as exc:  # noqa: BLE001
             forward_error = "%s: %s" % (type(exc).__name__, exc)
             log("转发到中转群失败（%s），改为下载后上传" % forward_error)
@@ -3671,7 +3842,10 @@ def deliver_via_relay_group(message, msgs, client):
         #   ① copy_message / copy_media_group（无转发头 + 回复原消息）
         #   ② 按 file_id 重新发送（无转发头 + 回复原消息）
         #   ③ 转发（兜底，会带转发头）
-        set_status("__中转中：② 机器人正在发送到本会话…__")
+        step_started = time.time()
+        send_base = "__中转中：② 机器人正在发送到本会话…（已用 %s）__"
+        set_status(send_base % "0 秒")
+        ticker2 = start_status_ticker(set_status, lambda took: send_base % took)
         errors = []
         delivered = False
         reply_to = getattr(message, "id", None)
@@ -3710,6 +3884,9 @@ def deliver_via_relay_group(message, msgs, client):
                 errors.append("机器人转发失败 `%s: %s`"
                               % (type(exc).__name__, exc))
                 log("机器人转发失败（%s: %s）" % (type(exc).__name__, exc))
+
+        ticker2.set()
+        log("超大文件：② 发送步骤完成（用时 %.1f 秒）" % (time.time() - step_started))
 
         # ---- 2.1) 最后兜底：机器人确实发不出去时，用用户账号自己发 ----
         delivered_by_user = False
@@ -4028,6 +4205,20 @@ def cmd_id(client, message):
     else:
         lines.append("本机器人只供管理员本人使用。")
     reply(message, "\n".join(lines))
+
+
+@bot.on_message(filters.command(["debug"]))
+def cmd_debug(client, message):
+    """/debug：打印所有线程调用栈到日志（排查卡死，仅管理员）。"""
+    user = getattr(message, "from_user", None)
+    if not is_owner(getattr(user, "id", None)):
+        reply(message, "❌ 只有管理员可以使用 /debug")
+        return
+    dump_threads("手动触发 /debug")
+    reply(message,
+          "已把所有线程的调用栈写入日志（看 `stdout` / `nohup` 输出）。\n\n"
+          "当前任务数：%d 个进行中，%d 个排队中"
+          % (len(QUEUE_RUNNING), sum(len(q) for q in QUEUE_PENDING.values())))
 
 
 @bot.on_message(filters.command(["quere", "queue"]))
@@ -4598,7 +4789,7 @@ def _login_check_password(message, state, text):
 
 @bot.on_message(filters.text & ~filters.command(
     ["start", "help", "usage", "id", "login", "logout", "cancel",
-     "quere", "queue", "group", "group_bind"]))
+     "quere", "queue", "group", "group_bind", "debug"]))
 def save(client, message):
     """核心入口：登录状态机 + 解析消息里的链接并处理。"""
     if not is_authorized(message):
@@ -4757,6 +4948,7 @@ def main():
 
     check_crypto()
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    threading.Thread(target=loop_watchdog, daemon=True, name="loop-watchdog").start()
 
     log("机器人启动中…")
     try:
